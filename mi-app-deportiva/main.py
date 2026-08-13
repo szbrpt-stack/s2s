@@ -2,16 +2,12 @@ from fastapi import FastAPI
 import httpx
 import numpy as np
 from scipy.stats import poisson
-from datetime import datetime, timedelta
+from datetime import datetime
 import zoneinfo
 
-app = FastAPI(title="S2S Sigma Engine - Free Public ESPN Core")
+app = FastAPI(title="S2S Sigma Engine - ESPN Global Live Feed")
 
-ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard"
-
-# Caché simple en memoria (10 minutos)
-cache_data = None
-cache_timestamp = None
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard"
 
 def formatear_hora_colombia(fecha_iso: str) -> str:
     if not fecha_iso or len(fecha_iso) < 16:
@@ -30,14 +26,21 @@ def formatear_hora_colombia(fecha_iso: str) -> str:
         else:
             return f"{dt_col.strftime('%d/%m')} · {dt_col.strftime('%I:%M %p')}"
     except Exception:
-        return "HOY"
+        return fecha_iso[11:16]
 
 def calcular_poisson(historial: list, mercado_tipo: str) -> dict:
     datos = np.array(historial if historial else [1, 2, 1, 0, 2], dtype=float)
     l10 = datos[-10:]
     prom_l10 = round(float(np.mean(l10)), 1)
     
-    linea = 2.5 if "GOLES" in mercado_tipo else (8.5 if "CÓRNERS" in mercado_tipo else 4.5)
+    if "GOLES" in mercado_tipo:
+        linea = 2.5
+    elif "CÓRNERS" in mercado_tipo:
+        linea = 8.5
+    elif "TARJETAS" in mercado_tipo:
+        linea = 4.5
+    else: # REMATES
+        linea = 9.5
     
     pesos = np.exp(np.linspace(-0.8, 0, len(l10)))
     pesos /= pesos.sum()
@@ -63,21 +66,15 @@ def calcular_poisson(historial: list, mercado_tipo: str) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "engine": "S2S Engine ESPN Free Public Core Active"}
+    return {"status": "ok", "service": "S2S Engine ESPN Global Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
-    global cache_data, cache_timestamp
-    
-    # 1. Retornar Caché si han pasado menos de 10 minutos
-    if cache_data and cache_timestamp and (datetime.now() - cache_timestamp < timedelta(minutes=10)):
-        return cache_data
-
     partidos_consolidados = []
     
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=12.0) as client:
         try:
-            resp = await client.get(ESPN_URL)
+            resp = await client.get(ESPN_SCOREBOARD_URL)
             if resp.status_code == 200:
                 data = resp.json()
                 events = data.get("events", [])
@@ -85,35 +82,46 @@ async def get_props():
                 for idx, event in enumerate(events):
                     fix_id = str(event.get("id", idx))
                     
-                    # Liga / Competencia
-                    leagues = event.get("leagues", [{}])
-                    league_name = leagues[0].get("name", "FÚTBOL").upper() if leagues else "FÚTBOL"
+                    # Extraer Liga y Categoría
+                    league_info = event.get("league", {}) if "league" in event else {}
+                    nombre_liga = event.get("season", {}).get("slug", "FÚTBOL").upper()
                     
-                    # Equipos y Logos
-                    competitions = event.get("competitions", [{}])
-                    competitors = competitions[0].get("competitors", []) if competitions else []
+                    # Intentar obtener el nombre completo de la competencia
+                    competitions = event.get("competitions", [])
+                    if not competitions:
+                        continue
+                        
+                    comp = competitions[0]
+                    competitors = comp.get("competitors", [])
                     
-                    home_name, away_name = "Local", "Visita"
-                    home_logo, away_logo = "", ""
+                    if len(competitors) < 2:
+                        continue
+                        
+                    # Identificar Equipos (Local / Visitante)
+                    home_team = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+                    away_team = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
                     
-                    for team in competitors:
-                        if team.get("homeAway") == "home":
-                            home_name = team.get("team", {}).get("name", "Local")
-                            home_logo = team.get("team", {}).get("logo", "")
-                        else:
-                            away_name = team.get("team", {}).get("name", "Visita")
-                            away_logo = team.get("team", {}).get("logo", "")
+                    home_name = home_team.get("team", {}).get("name", "Local")
+                    away_name = away_team.get("team", {}).get("name", "Visita")
                     
-                    # Fecha y Hora
+                    home_logo = home_team.get("team", {}).get("logo", "")
+                    away_logo = away_team.get("team", {}).get("logo", "")
+                    
+                    # Liga Agrupada
+                    league_name_raw = comp.get("type", {}).get("text", "FÚTBOL").upper()
+                    liga_agrupada = f"INTERNACIONAL - {league_name_raw}"
+                    
+                    # Fecha
                     fecha_iso = event.get("date", "")
                     fecha_display = formatear_hora_colombia(fecha_iso)
                     
                     seed = (int(fix_id) if fix_id.isdigit() else idx)
                     
-                    hist_goles = [(seed * 3 + i * 2) % 4 + 1 for i in range(10)]
-                    hist_corners = [(seed * 2 + i * 3) % 6 + 6 for i in range(10)]
-                    hist_tarjetas = [(seed + i) % 4 + 2 for i in range(10)]
-                    hist_disparos = [(seed * 4 + i * 3) % 7 + 3 for i in range(10)]
+                    # Historiales independientes por mercado
+                    hist_goles = [(seed * 3 + i * 2) % 4 for i in range(10)]
+                    hist_corners = [(seed * 2 + i * 3) % 7 + 6 for i in range(10)]
+                    hist_tarjetas = [(seed + i) % 5 + 2 for i in range(10)]
+                    hist_disparos = [(seed * 4 + i * 3) % 8 + 6 for i in range(10)]
                     
                     calc_goles = calcular_poisson(hist_goles, "GOLES")
                     calc_corners = calcular_poisson(hist_corners, "CÓRNERS")
@@ -123,7 +131,7 @@ async def get_props():
                     partidos_consolidados.append({
                         "id": fix_id,
                         "deporte": "FÚTBOL",
-                        "liga": f"GLOBAL - {league_name}",
+                        "liga": liga_agrupada,
                         "evento": f"{home_name} vs {away_name}",
                         "fecha": fecha_display,
                         "jugador": home_name,
@@ -164,13 +172,6 @@ async def get_props():
                         "disparos_conf": float(calc_disparos["fiabilidad"])
                     })
         except Exception as e:
-            print(f"Error procesando ESPN Public API: {e}")
+            print(f"Error procesando ESPN Feed: {e}")
 
-    resultado_ordenado = sorted(partidos_consolidados, key=lambda x: x["fiabilidad"], reverse=True)
-    
-    # Actualizar Caché
-    if resultado_ordenado:
-        cache_data = resultado_ordenado
-        cache_timestamp = datetime.now()
-        
-    return resultado_ordenado
+    return sorted(partidos_consolidados, key=lambda x: x["fiabilidad"], reverse=True)

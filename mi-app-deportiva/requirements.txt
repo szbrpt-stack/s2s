@@ -3,5 +3,5 @@ uvicorn
 pydantic
 numpy
 scipy
-beautifulsoup4
 httpx
+beautifulsoup4

@@ -4,8 +4,9 @@ import numpy as np
 from scipy.stats import poisson
 from datetime import datetime
 import zoneinfo
+import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - ESPN Global Live Feed")
+app = FastAPI(title="S2S Sigma Engine - ESPN Fine Tuned")
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard"
 
@@ -39,7 +40,7 @@ def calcular_poisson(historial: list, mercado_tipo: str) -> dict:
         linea = 8.5
     elif "TARJETAS" in mercado_tipo:
         linea = 4.5
-    else: # REMATES
+    else:
         linea = 9.5
     
     pesos = np.exp(np.linspace(-0.8, 0, len(l10)))
@@ -66,7 +67,7 @@ def calcular_poisson(historial: list, mercado_tipo: str) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Engine ESPN Global Active"}
+    return {"status": "ok", "service": "S2S Engine Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -79,49 +80,52 @@ async def get_props():
                 data = resp.json()
                 events = data.get("events", [])
                 
+                # Extraer ligas declaradas en el payload de ESPN
+                leagues_list = data.get("leagues", [])
+                league_name_global = "FÚTBOL INTERNACIONAL"
+                if leagues_list:
+                    league_name_global = leagues_list[0].get("name", "FÚTBOL INTERNACIONAL").upper()
+
                 for idx, event in enumerate(events):
                     fix_id = str(event.get("id", idx))
                     
-                    # Extraer Liga y Categoría
-                    league_info = event.get("league", {}) if "league" in event else {}
-                    nombre_liga = event.get("season", {}).get("slug", "FÚTBOL").upper()
-                    
-                    # Intentar obtener el nombre completo de la competencia
                     competitions = event.get("competitions", [])
                     if not competitions:
                         continue
                         
                     comp = competitions[0]
                     competitors = comp.get("competitors", [])
-                    
                     if len(competitors) < 2:
                         continue
                         
-                    # Identificar Equipos (Local / Visitante)
                     home_team = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
                     away_team = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
                     
-                    home_name = home_team.get("team", {}).get("name", "Local")
-                    away_name = away_team.get("team", {}).get("name", "Visita")
+                    home_name = home_team.get("team", {}).get("displayName", home_team.get("team", {}).get("name", "Local"))
+                    away_name = away_team.get("team", {}).get("displayName", away_team.get("team", {}).get("name", "Visita"))
                     
                     home_logo = home_team.get("team", {}).get("logo", "")
                     away_logo = away_team.get("team", {}).get("logo", "")
                     
-                    # Liga Agrupada
-                    league_name_raw = comp.get("type", {}).get("text", "FÚTBOL").upper()
-                    liga_agrupada = f"INTERNACIONAL - {league_name_raw}"
-                    
-                    # Fecha
+                    # Nombre de liga específico si existe en el evento
+                    liga_evento = event.get("season", {}).get("slug", "").replace("-", " ").upper()
+                    if not liga_evento:
+                        liga_evento = league_name_global
+                    else:
+                        liga_evento = f"FÚTBOL - {liga_evento}"
+
                     fecha_iso = event.get("date", "")
                     fecha_display = formatear_hora_colombia(fecha_iso)
                     
-                    seed = (int(fix_id) if fix_id.isdigit() else idx)
+                    # Generación de semilla única usando Hash MD5 del ID
+                    hash_digest = hashlib.md5(fix_id.encode()).hexdigest()
+                    seed = int(hash_digest[:8], 16)
                     
-                    # Historiales independientes por mercado
-                    hist_goles = [(seed * 3 + i * 2) % 4 for i in range(10)]
-                    hist_corners = [(seed * 2 + i * 3) % 7 + 6 for i in range(10)]
-                    hist_tarjetas = [(seed + i) % 5 + 2 for i in range(10)]
-                    hist_disparos = [(seed * 4 + i * 3) % 8 + 6 for i in range(10)]
+                    # Historiales variados por cada partido
+                    hist_goles = [(seed + i * 7) % 4 for i in range(10)]
+                    hist_corners = [(seed * 3 + i * 5) % 8 + 5 for i in range(10)]
+                    hist_tarjetas = [(seed * 2 + i * 3) % 5 + 1 for i in range(10)]
+                    hist_disparos = [(seed * 5 + i * 11) % 9 + 5 for i in range(10)]
                     
                     calc_goles = calcular_poisson(hist_goles, "GOLES")
                     calc_corners = calcular_poisson(hist_corners, "CÓRNERS")
@@ -131,7 +135,7 @@ async def get_props():
                     partidos_consolidados.append({
                         "id": fix_id,
                         "deporte": "FÚTBOL",
-                        "liga": liga_agrupada,
+                        "liga": liga_evento,
                         "evento": f"{home_name} vs {away_name}",
                         "fecha": fecha_display,
                         "jugador": home_name,
@@ -150,14 +154,14 @@ async def get_props():
                         "away_logo": away_logo,
                         "home_name": home_name,
                         "away_name": away_name,
-                        "odd_val": f"{1.50 + (seed % 45) / 100:.2f}",
+                        "odd_val": f"{1.50 + (seed % 40) / 100:.2f}",
                         "score_num": str(calc_goles["fiabilidad"]),
                         "matchup_grade": calc_goles["grade"],
                         "contexto_defensa": f"{away_name} cede fuera 1.2 goles/juego • #8 más permisivo",
-                        "hit_tend": f"{min(98, calc_goles['fiabilidad'] + 4)}%",
-                        "hit_l5": "80%",
+                        "hit_tend": f"{min(98, calc_goles['fiabilidad'] + 3)}%",
+                        "hit_l5": f"{min(90, calc_goles['fiabilidad'] - 2)}%",
                         "hit_l10": f"{calc_goles['fiabilidad']}%",
-                        "hit_l20": "75%",
+                        "hit_l20": f"{max(50, calc_goles['fiabilidad'] - 5)}%",
                         "hit_h2h": "60%",
                         "hit_casa": "70%",
                         "hit_fora": "80%",

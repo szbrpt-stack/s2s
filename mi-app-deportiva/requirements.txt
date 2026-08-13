@@ -1,5 +1,7 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-pydantic==2.6.4
-numpy==1.26.4
-pandas==2.2.1
+fastapi
+uvicorn
+pydantic
+numpy
+scipy
+beautifulsoup4
+httpx

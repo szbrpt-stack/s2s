@@ -77,7 +77,6 @@ def root():
 @app.get("/api/v1/props")
 async def get_props():
     fecha_hoy = obtener_fecha_colombia()
-    # Inyección de timezone=America/Bogota directa en la API oficial
     url_fixtures = f"{BASE_URL}/fixtures?date={fecha_hoy}&timezone=America/Bogota"
     partidos_consolidados = []
     
@@ -89,8 +88,6 @@ async def get_props():
                 data = resp.json()
                 fixtures = data.get("response", [])
                 
-                # Si la API oficial devuelve lista vacía para la fecha exacta,
-                # consultamos la ventana de proximidad directa de la API sin filtros inventados
                 if not fixtures:
                     url_next = f"{BASE_URL}/fixtures?next=30&timezone=America/Bogota"
                     resp_next = await client.get(url_next, headers=HEADERS)
@@ -103,7 +100,6 @@ async def get_props():
                     teams_data = fix.get("teams", {})
                     
                     status_short = fixture_data.get("status", {}).get("short", "")
-                    # Ocultar únicamente partidos terminados
                     if status_short in ["FT", "AET", "PEN", "CANC", "ABD"]:
                         continue
 
@@ -126,7 +122,6 @@ async def get_props():
                     
                     seed = (int(fix_id) if fix_id.isdigit() else idx)
                     
-                    # Carga de historiales para cálculo de probabilidades Poisson
                     hist_goles = [(seed * 3 + i * 2) % 4 + 1 for i in range(10)]
                     hist_corners = [(seed * 2 + i * 3) % 6 + 6 for i in range(10)]
                     hist_tarjetas = [(seed + i) % 4 + 2 for i in range(10)]

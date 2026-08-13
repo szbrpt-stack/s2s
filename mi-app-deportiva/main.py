@@ -5,7 +5,7 @@ from scipy.stats import poisson
 from datetime import datetime
 import zoneinfo
 
-app = FastAPI(title="S2S Sigma Original Core")
+app = FastAPI(title="S2S Sigma Production Engine")
 
 API_KEY = "7b3366f3d161d4705131a05a375dac34"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -31,13 +31,13 @@ def obtener_fecha_colombia() -> str:
 
 def formatear_hora_colombia(fecha_iso: str) -> str:
     if not fecha_iso or len(fecha_iso) < 16:
-        return "HOY"
+        return "PROGRAMADO"
     try:
         tz_utc = zoneinfo.ZoneInfo("UTC")
         tz_col = zoneinfo.ZoneInfo("America/Bogota")
         dt_utc = datetime.fromisoformat(fecha_iso.replace("Z", "+00:00")).replace(tzinfo=tz_utc)
         dt_col = dt_utc.astimezone(tz_col)
-        return dt_col.strftime("%I:%M %p")
+        return dt_col.strftime("%d/%m %I:%M %p")
     except Exception:
         return fecha_iso[11:16]
 
@@ -76,20 +76,23 @@ def root():
 @app.get("/api/v1/props")
 async def get_props():
     fecha_hoy = obtener_fecha_colombia()
-    # Consulta directa de la fecha sin filtros destructivos
-    url_fixtures = f"{BASE_URL}/fixtures?date={fecha_hoy}"
     partidos_consolidados = []
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
+            # 1. Intentar consultar partidos programados/pendientes
+            url_fixtures = f"{BASE_URL}/fixtures?date={fecha_hoy}&timezone=America/Bogota"
             resp = await client.get(url_fixtures, headers=HEADERS)
             fixtures = []
-            if resp.status_code == 200:
-                fixtures = resp.json().get("response", [])
             
-            # Si no hay fixtures en la fecha de hoy, consulta los eventos más próximos sin descartar nada
+            if resp.status_code == 200:
+                data = resp.json().get("response", [])
+                # Filtrar solo los que NO han terminado
+                fixtures = [f for f in data if f.get("fixture", {}).get("status", {}).get("short") not in ["FT", "AET", "PEN", "CANC", "ABD"]]
+            
+            # 2. SI YA NO HAY PARTIDOS PENDIENTES HOY, pedir los próximos 50 juegos a la API de Football
             if not fixtures:
-                url_next = f"{BASE_URL}/fixtures?next=30"
+                url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
                 resp_next = await client.get(url_next, headers=HEADERS)
                 if resp_next.status_code == 200:
                     fixtures = resp_next.json().get("response", [])
@@ -114,7 +117,6 @@ async def get_props():
                 
                 fecha_iso = fixture_data.get("date", "")
                 hora_colombia = formatear_hora_colombia(fecha_iso)
-                fecha_display = f"HOY · {hora_colombia}"
                 
                 seed = (int(fix_id) if fix_id.isdigit() else idx)
                 
@@ -133,7 +135,7 @@ async def get_props():
                     "deporte": "FÚTBOL",
                     "liga": liga_agrupada,
                     "evento": f"{home_name} vs {away_name}",
-                    "fecha": fecha_display,
+                    "fecha": hora_colombia,
                     "jugador": home_name,
                     "mercado": f"{calc_goles['recomendacion']} {calc_goles['linea']} GOLES",
                     "linea": calc_goles["linea"],

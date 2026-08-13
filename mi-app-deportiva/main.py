@@ -4,18 +4,23 @@ import numpy as np
 from scipy.stats import poisson
 from datetime import datetime, timedelta
 
-app = FastAPI(title="S2S Sigma Advanced Engine")
+app = FastAPI(title="S2S Sigma Consolidated Engine")
 
 API_KEY = "7b3366f3d161d4705131a05a375dac34"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
+
+# Lista de IDs o nombres prioritarios para destacar primero
+LIGAS_PRIORITARIAS = [
+    "UEFA CHAMPIONS LEAGUE", "UEFA EUROPA LEAGUE", "CONMEBOL LIBERTADORES", 
+    "PREMIER LEAGUE", "LIGA BETPLAY", "LA LIGA", "SERIE A", "BUNDESLIGA", "LEAGUES CUP"
+]
 
 def formatear_hora_colombia(fecha_iso: str) -> str:
     if not fecha_iso or len(fecha_iso) < 16:
         return "HOY"
     try:
         dt_utc = datetime.fromisoformat(fecha_iso.replace("Z", "+00:00"))
-        # Convertir UTC a Colombia (UTC-5)
         dt_col = dt_utc - timedelta(hours=5)
         return dt_col.strftime("%I:%M %p")
     except Exception:
@@ -34,11 +39,11 @@ def calcular_poisson(historial: list, linea: float) -> dict:
     prob_under = 100 - prob_over
     
     if lambda_ponderado > linea:
-        recomendacion = "OVER"
+        recomendacion = "MÁS"
         fiabilidad = prob_over
         ventaja = prom_l10 - linea
     else:
-        recomendacion = "UNDER"
+        recomendacion = "MENOS"
         fiabilidad = prob_under
         ventaja = linea - prom_l10
         
@@ -52,13 +57,13 @@ def calcular_poisson(historial: list, linea: float) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Sigma Engine Full Operational"}
+    return {"status": "ok", "service": "S2S Consolidated API Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
     fecha_hoy = datetime.now().strftime("%Y-%m-%d")
     url_fixtures = f"{BASE_URL}/fixtures?date={fecha_hoy}"
-    props = []
+    partidos_consolidados = []
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -66,7 +71,7 @@ async def get_props():
             if resp.status_code == 200:
                 fixtures = resp.json().get("response", [])
                 
-                for idx, fix in enumerate(fixtures[:30]):
+                for idx, fix in enumerate(fixtures[:35]):
                     fixture_data = fix.get("fixture", {})
                     league_data = fix.get("league", {})
                     teams_data = fix.get("teams", {})
@@ -82,38 +87,44 @@ async def get_props():
                     
                     seed = (int(fix_id) if fix_id.isdigit() else idx)
                     
-                    # Diversificación de historiales reales/estimados por mercado
                     hist_goles = [(seed * 3 + i * 2) % 5 + 1 for i in range(10)]
                     hist_corners = [(seed * 2 + i * 3) % 7 + 6 for i in range(10)]
                     hist_tarjetas = [(seed + i) % 5 + 2 for i in range(10)]
                     
-                    mercados_config = [
-                        ("Goles Totales", 2.5, hist_goles),
-                        ("Córners Totales", 8.5, hist_corners),
-                        ("Tarjetas Totales", 4.5, hist_tarjetas)
-                    ]
+                    calc_goles = calcular_poisson(hist_goles, 2.5)
+                    calc_corners = calcular_poisson(hist_corners, 8.5)
+                    calc_tarjetas = calcular_poisson(hist_tarjetas, 4.5)
                     
-                    for sub_idx, (mercado_nombre, linea_val, hist_datos) in enumerate(mercados_config):
-                        calc = calcular_poisson(hist_datos, linea_val)
-                        
-                        props.append({
-                            "id": f"{fix_id}_{sub_idx}",
-                            "deporte": "FÚTBOL",
-                            "liga": liga_nombre,
-                            "evento": evento_str,
-                            "fecha": fecha_display,
-                            "jugador": home_team.get("name", "Local"),
-                            "mercado": mercado_nombre,
-                            "linea": linea_val,
-                            "fiabilidad": calc["fiabilidad"],
-                            "recomendacion": calc["recomendacion"],
-                            "promedio_l10": calc["promedio_l10"],
-                            "senial": calc["vantagem"],
-                            "racha": calc["grade"],
-                            "historial": hist_datos,
-                            "h2h": hist_datos[:5]
-                        })
+                    # Consolidado en un único mercado principal para la tarjeta + lista de mercados alternativos
+                    partidos_consolidados.append({
+                        "id": fix_id,
+                        "deporte": "FÚTBOL",
+                        "liga": liga_nombre,
+                        "evento": evento_str,
+                        "fecha": fecha_display,
+                        "jugador": home_team.get("name", "Local"),
+                        "mercado": f"{calc_goles['recomendacion']} 2.5 Goles",
+                        "linea": 2.5,
+                        "fiabilidad": calc_goles["fiabilidad"],
+                        "recomendacion": calc_goles["recomendacion"],
+                        "promedio_l10": calc_goles["promedio_l10"],
+                        "senial": calc_goles["vantagem"],
+                        "racha": calc_goles["grade"],
+                        "historial": hist_goles,
+                        "h2h": hist_goles[:5],
+                        # Mercados adicionales integrados
+                        "mercado_corners": f"{calc_corners['recomendacion']} 8.5 Córners ({calc_corners['fiabilidad']}%)",
+                        "mercado_tarjetas": f"{calc_tarjetas['recomendacion']} 4.5 Tarjetas ({calc_tarjetas['fiabilidad']}%)"
+                    })
         except Exception as e:
             print(f"Error procesando API-Football: {e}")
 
-    return sorted(props, key=lambda x: x["fiabilidad"], reverse=True)
+    # Priorizar ligas importantes primero
+    def prioridad_liga(item):
+        nombre = item["liga"]
+        for p_idx, prio in enumerate(LIGAS_PRIORITARIAS):
+            if prio in nombre:
+                return p_idx
+        return 999
+
+    return sorted(partidos_consolidados, key=lambda x: (prioridad_liga(x), -x["fiabilidad"]))

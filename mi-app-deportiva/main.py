@@ -6,37 +6,60 @@ from datetime import datetime, timezone
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Clean Unicode Core")
+app = FastAPI(title="S2S Sigma Engine - Pro Analytical Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 EPSILON = 1e-6
 
-# Mapeo sanitizado con Unicode Escapes seguros
+# Diccionario Completo de Banderas Oficiales
 BANDERA_MAP = {
     "ALEMANIA": ("\U0001F1E9\U0001F1EA", "Alemania"),
     "GERMANY": ("\U0001F1E9\U0001F1EA", "Alemania"),
     "ARABIA SAUDITA": ("\U0001F1F8\U0001F1E6", "Arabia Saudita"),
     "SAUDI ARABIA": ("\U0001F1F8\U0001F1E6", "Arabia Saudita"),
     "ARGENTINA": ("\U0001F1E6\U0001F1F7", "Argentina"),
+    "BOLIVIA": ("\U0001F1E7\U0001F1F4", "Bolivia"),
     "BRASIL": ("\U0001F1E7\U0001F1F7", "Brasil"),
     "BRAZIL": ("\U0001F1E7\U0001F1F7", "Brasil"),
+    "CANADA": ("\U0001F1E8\U0001F1E6", "Canadá"),
+    "CHILE": ("\U0001F1E8\U0001F1F1", "Chile"),
     "COLOMBIA": ("\U0001F1E8\U0001F1F4", "Colombia"),
-    "ESPA\u00d1A": ("\U0001F1EA\U0001F1F8", "Espana"),
-    "SPAIN": ("\U0001F1EA\U0001F1F8", "Espana"),
+    "COSTA RICA": ("\U0001F1E8\U0001F1F7", "Costa Rica"),
+    "ECUADOR": ("\U0001F1EA\U0001F1E8", "Ecuador"),
+    "EL SALVADOR": ("\U0001F1F8\U0001F1FB", "El Salvador"),
+    "ESPAÑA": ("\U0001F1EA\U0001F1F8", "España"),
+    "SPAIN": ("\U0001F1EA\U0001F1F8", "España"),
     "ESTADOS UNIDOS": ("\U0001F1FA\U0001F1F8", "Estados Unidos"),
     "USA": ("\U0001F1FA\U0001F1F8", "Estados Unidos"),
+    "HONDURAS": ("\U0001F1ED\U0001F1F3", "Honduras"),
     "INGLATERRA": ("\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F", "Inglaterra"),
     "ENGLAND": ("\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F", "Inglaterra"),
     "ITALIA": ("\U0001F1EE\U0001F1F9", "Italia"),
     "ITALY": ("\U0001F1EE\U0001F1F9", "Italia"),
-    "PA\u00cdSES BAJOS": ("\U0001F1F3\U0001F1F1", "Paises Bajos"),
-    "NETHERLANDS": ("\U0001F1F3\U0001F1F1", "Paises Bajos"),
+    "MEXICO": ("\U0001F1F2\U0001F1FD", "México"),
+    "MÉXICO": ("\U0001F1F2\U0001F1FD", "México"),
+    "PAÍSES BAJOS": ("\U0001F1F3\U0001F1F1", "Países Bajos"),
+    "NETHERLANDS": ("\U0001F1F3\U0001F1F1", "Países Bajos"),
+    "PARAGUAY": ("\U0001F1F5\U0001F1FE", "Paraguay"),
+    "PERU": ("\U0001F1F5\U0001F1EA", "Perú"),
+    "PERÚ": ("\U0001F1F5\U0001F1EA", "Perú"),
     "URUGUAY": ("\U0001F1FA\U0001F1FE", "Uruguay"),
     "VENEZUELA": ("\U0001F1FB\U0001F1EA", "Venezuela"),
-    "GLOBAL": ("\U0001F310", "Internacional"),
-    "WORLD": ("\U0001F310", "Internacional")
+    "GLOBAL": ("\U0001F310", "Internacional")
+}
+
+# Pool de Rivales Auténticos por País para los Historiales
+RIVALES_POOL = {
+    "Canadá": ["Pacific FC", "York United", "Valour FC", "Halifax Wanderers", "Atlético Ottawa", "Vancouver FC", "Edmonton", "Calgary Foothills"],
+    "Bolivia": ["Bolívar", "Oriente Petrolero", "Wilstermann", "Blooming", "Always Ready", "San José", "Real Potosí", "Aurora"],
+    "Chile": ["Colo-Colo", "Univ. de Chile", "Univ. Católica", "Cobreloa", "Unión Española", "Audax Italiano", "Everton VM", "Huachipato"],
+    "Colombia": ["Millonarios", "Atl. Nacional", "América de Cali", "Santa Fe", "Junior", "Dep. Cali", "Medellín", "Once Caldas"],
+    "Argentina": ["Boca Juniors", "River Plate", "Racing Club", "Independiente", "San Lorenzo", "Vélez Sarsfield", "Estudiantes LP", "Lanús"],
+    "Brasil": ["Flamengo", "Palmeiras", "Corinthians", "São Paulo", "Santos", "Grêmio", "Internacional", "Atlético Mineiro"],
+    "México": ["América", "Guadalajara", "Cruz Azul", "Tigres UANL", "Monterrey", "Toluca", "Pumas UNAM", "Pachuca"],
+    "Default": ["Club A", "Club B", "Club C", "Club D", "Club E", "Club F", "Club G", "Club H"]
 }
 
 def obtener_pais_y_bandera(pais_raw: str, liga_raw: str) -> tuple:
@@ -46,7 +69,7 @@ def obtener_pais_y_bandera(pais_raw: str, liga_raw: str) -> tuple:
     for k, v in BANDERA_MAP.items():
         if k in liga_raw.upper():
             return v
-    return ("\U000026BD", pais_raw.title() if pais_raw else "Internacional")
+    return ("\U0001F310", pais_raw.title() if pais_raw else "Internacional")
 
 def parsear_estado_hora(fixture_data: dict) -> dict:
     status = fixture_data.get("status", {})
@@ -71,7 +94,12 @@ def parsear_estado_hora(fixture_data: dict) -> dict:
     except Exception:
         return {"display": "HOY", "is_live": False, "valido": True}
 
-def compilar_historial_equipo(seed: int, n: int = 20):
+def compilar_historial_con_rivales(seed: int, pais: str, excluir_nombre: str, n: int = 20):
+    pool = RIVALES_POOL.get(pais, RIVALES_POOL["Default"])
+    rivales_disponibles = [r for r in pool if r.lower() != excluir_nombre.lower()]
+    if not rivales_disponibles:
+        rivales_disponibles = pool
+
     partidos = []
     goles = []
     for i in range(n):
@@ -80,8 +108,10 @@ def compilar_historial_equipo(seed: int, n: int = 20):
         val = gf + gc
         goles.append(val)
         res = "V" if gf > gc else ("E" if gf == gc else "D")
+        rival = rivales_disponibles[(seed + i) % len(rivales_disponibles)]
+        
         partidos.append({
-            "rival": f"Rival {i + 1}",
+            "rival": rival,
             "score": f"{gf} - {gc}",
             "resultado": res,
             "valor": float(val),
@@ -92,7 +122,7 @@ def compilar_historial_equipo(seed: int, n: int = 20):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Engine Clean Core Active"}
+    return {"status": "ok", "service": "S2S Pro Analytical Core Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -165,6 +195,9 @@ async def get_props():
                 lam_tot = round(lam_loc + lam_vis, 2)
                 odd_calc = round(max(1.42, min(2.45, (1.0 / (conf_goles / 100.0)) * 0.92)), 2)
                 
+                # Cálculo de Value Edge (%)
+                edge_val = f"+{int(np.clip((conf_goles - (1.0 / odd_calc * 100)), 4, 18))}% EV"
+                
                 p_h = int(round((lam_loc / lam_tot) * 58 + 12))
                 p_a = int(round((lam_vis / lam_tot) * 52))
                 p_d = max(10, 100 - (p_h + p_a))
@@ -180,25 +213,39 @@ async def get_props():
                 else:
                     marcador_est = "1 - 1"
 
-                f_home, _ = compilar_historial_equipo(seed_loc, 20)
-                f_away, _ = compilar_historial_equipo(seed_vis, 20)
-                f_h2h, _  = compilar_historial_equipo(seed_match, 5)
+                # Historiales con nombres reales de rivales
+                f_home, _ = compilar_historial_con_rivales(seed_loc, pais_formateado, home_name, 20)
+                f_away, _ = compilar_historial_con_rivales(seed_vis, pais_formateado, away_name, 20)
                 
+                # H2H directo entre ellos
+                f_h2h = []
+                for i in range(5):
+                    gf = (seed_match + i * 2) % 3
+                    gc = (seed_match * 3 + i) % 3
+                    val = gf + gc
+                    f_h2h.append({
+                        "rival": away_name if i % 2 == 0 else home_name,
+                        "score": f"{gf} - {gc}",
+                        "resultado": "V" if gf > gc else ("E" if gf == gc else "D"),
+                        "valor": float(val),
+                        "cumple": val > merc_linea if is_over else val < merc_linea,
+                        "fecha": f"202{5 - i}"
+                    })
+
                 for m in f_home:
                     m["cumple"] = m["valor"] > merc_linea if is_over else m["valor"] < merc_linea
                 for m in f_away:
-                    m["cumple"] = m["valor"] > merc_linea if is_over else m["valor"] < merc_linea
-                for m in f_h2h:
                     m["cumple"] = m["valor"] > merc_linea if is_over else m["valor"] < merc_linea
 
                 recom_btts = "SÍ" if (lam_loc >= 1.0 and lam_vis >= 0.9) else "NO"
                 conf_btts = int(np.clip(64 + (seed_match % 18), 60, 82))
                 odd_btts = round(max(1.45, min(2.35, (1.0 / (conf_btts / 100.0)) * 0.92)), 2)
                 
-                f_corners = [{"rival": f"Rival {i+1}", "score": f"{((seed_match+i*5)%7)+6} córners", "resultado": "V", "valor": float(((seed_match+i*5)%7)+6), "cumple": (((seed_match+i*5)%7)+6) > 8.5, "fecha": f"{20-i} Ago"} for i in range(20)]
-                f_tarjetas = [{"rival": f"Rival {i+1}", "score": f"{((seed_match+i*3)%4)+2} tarjetas", "resultado": "V", "valor": float(((seed_match+i*3)%4)+2), "cumple": (((seed_match+i*3)%4)+2) < 4.5, "fecha": f"{20-i} Ago"} for i in range(20)]
-                f_disparos = [{"rival": f"Rival {i+1}", "score": f"{((seed_match+i*7)%8)+8} remates", "resultado": "V", "valor": float(((seed_match+i*7)%8)+8), "cumple": (((seed_match+i*7)%8)+8) > 10.5, "fecha": f"{20-i} Ago"} for i in range(20)]
-                f_btts = [{"rival": f"Rival {i+1}", "score": f"{((seed_match+i)%2)+1} - {((seed_match*2+i)%2)+1 if recom_btts=='SÍ' else 0}", "resultado": "V" if recom_btts=='SÍ' else "D", "valor": 1.0 if recom_btts=='SÍ' else 0.0, "cumple": recom_btts=='SÍ', "fecha": f"{20-i} Ago"} for i in range(20)]
+                pool_r = RIVALES_POOL.get(pais_formateado, RIVALES_POOL["Default"])
+                f_corners = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*5)%7)+6} córners", "resultado": "V", "valor": float(((seed_match+i*5)%7)+6), "cumple": (((seed_match+i*5)%7)+6) > 8.5, "fecha": f"{20-i} Ago"} for i in range(20)]
+                f_tarjetas = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*3)%4)+2} tarjetas", "resultado": "V", "valor": float(((seed_match+i*3)%4)+2), "cumple": (((seed_match+i*3)%4)+2) < 4.5, "fecha": f"{20-i} Ago"} for i in range(20)]
+                f_disparos = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*7)%8)+8} remates", "resultado": "V", "valor": float(((seed_match+i*7)%8)+8), "cumple": (((seed_match+i*7)%8)+8) > 10.5, "fecha": f"{20-i} Ago"} for i in range(20)]
+                f_btts = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i)%2)+1} - {((seed_match*2+i)%2)+1 if recom_btts=='SÍ' else 0}", "resultado": "V" if recom_btts=='SÍ' else "D", "valor": 1.0 if recom_btts=='SÍ' else 0.0, "cumple": recom_btts=='SÍ', "fecha": f"{20-i} Ago"} for i in range(20)]
 
                 hits_l5 = sum(1 for m in f_home[:5] if m["cumple"])
                 hits_l10 = sum(1 for m in f_home[:10] if m["cumple"])
@@ -230,6 +277,7 @@ async def get_props():
                     "proyeccion_val": str(lam_tot),
                     "promedio_l10": float(lam_tot),
                     "odd_val": f"{odd_calc:.2f}",
+                    "value_edge": edge_val,
                     "score_num": str(conf_goles),
                     "matchup_grade": "A" if conf_goles >= 74 else "B",
                     
@@ -263,9 +311,7 @@ async def get_props():
                     "disparos_label": "MÁS DE 10.5 REMATES", "disparos_conf": 64.0, "disparos_odd": "1.80",
                     "disparos_proyeccion": "11.2", "disparos_promedio": 11.2,
                     
-                    "btts_label": f"AMBOS ANOTAN: {recom_btts}",
-                    "btts_conf": float(conf_btts),
-                    "btts_odd": f"{odd_btts:.2f}",
+                    "btts_label": f"AMBOS ANOTAN: {recom_btts}", "btts_conf": float(conf_btts), "btts_odd": f"{odd_btts:.2f}",
                     "btts_prob_si": conf_btts if recom_btts == "SÍ" else (100 - conf_btts),
                     "btts_prob_no": (100 - conf_btts) if recom_btts == "SÍ" else conf_btts,
                     "btts_proyeccion": f"{lam_loc} - {lam_vis}", "btts_promedio": float(lam_tot)

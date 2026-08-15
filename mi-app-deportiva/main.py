@@ -7,7 +7,7 @@ import zoneinfo
 from typing import Dict, List, Any
 import asyncio
 
-app = FastAPI(title="S2S Sigma Engine - Raw Global Catalog Core")
+app = FastAPI(title="S2S Sigma Engine - Complete Daily Catalog Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -120,7 +120,6 @@ async def fetch_historial_rapido(client: httpx.AsyncClient, team_id: int) -> Lis
         pass
     
     if not partidos:
-        # Fallback de seguridad para evitar bloqueos si un equipo no tiene historial cargado
         partidos = [{"rival": "Rival Genérico", "score": "1 - 1", "gf": 1, "gc": 1, "corn_fav": 5, "corn_con": 4, "tarj_prop": 2, "tarj_prov": 2, "rem_fav": 12, "rem_con": 10, "resultado": "E", "fecha": "Reciente"}]
 
     CACHE_EQUIPOS[team_id] = partidos
@@ -128,27 +127,21 @@ async def fetch_historial_rapido(client: httpx.AsyncClient, team_id: int) -> Lis
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Raw Direct Core Operational"}
+    return {"status": "ok", "service": "S2S Complete Daily Core Operational"}
 
 @app.get("/api/v1/props")
 async def get_props():
     tz_col = zoneinfo.ZoneInfo("America/Bogota")
     hoy_str = datetime.now(tz_col).strftime("%Y-%m-%d")
     
-    # PEDIMOS DIRECTAMENTE TODO LO DISPONIBLE PARA HOY SIN FILTROS EXTRAÑOS
+    # CONSULTA DIRECTA Y MASIVA POR FECHA SIN NINGÚN CORTE
     url_dia = f"{BASE_URL}/fixtures?date={hoy_str}&timezone=America/Bogota"
     partidos_consolidados = []
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=45.0) as client:
         try:
             resp = await client.get(url_dia, headers=HEADERS)
             fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
-
-            # Si la fecha exacta tira poco, respaldamos con los siguientes 100 partidos globales directos
-            if len(fixtures) < 10:
-                url_next = f"{BASE_URL}/fixtures?next=100&timezone=America/Bogota"
-                resp_next = await client.get(url_next, headers=HEADERS)
-                fixtures = resp_next.json().get("response", []) if resp_next.status_code == 200 else []
 
             for idx, fix in enumerate(fixtures):
                 fixture_data = fix.get("fixture", {})
@@ -234,7 +227,8 @@ async def get_props():
                     "btts_proyeccion": "1.3 - 1.1"
                 })
         except Exception as e:
-            print(f"[ERROR RAW API]: {e}")
+            print(f"[ERROR COMPLETE API]: {e}")
             return []
 
-    return partidos_consolidados
+    estado_orden = {"LIVE": 0, "NS": 1, "FT": 2}
+    return sorted(partidos_consolidados, key=lambda x: (x.get("pais", "Z"), estado_orden.get(x.get("status_code", "NS"), 1)))

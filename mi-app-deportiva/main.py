@@ -6,7 +6,7 @@ from datetime import datetime
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Guaranteed Feed 24/7")
+app = FastAPI(title="S2S Sigma Engine - Guaranteed 24/7 Multi-League Feed")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -115,7 +115,7 @@ def calcular_btts(hist_goles_local: list, hist_goles_visita: list) -> dict:
         "hit_l10": f"{aciertos * 10}%"
     }
 
-def construir_matches_forma(seed: int, home_name: str, away_name: str, linea: float, tipo: str) -> list:
+def construir_matches_forma(seed: int, linea: float, tipo: str) -> list:
     rivales_pool = ["Nacional", "Millonarios", "Santa Fe", "Junior", "América", "Tolima", "Cali", "Medellín", "Envigado", "Bucaramanga"]
     matches = []
     
@@ -157,7 +157,7 @@ def construir_matches_forma(seed: int, home_name: str, away_name: str, linea: fl
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Engine 24/7 Operational"}
+    return {"status": "ok", "service": "S2S Engine 24/7 Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -172,7 +172,6 @@ async def get_props():
             if resp.status_code == 200:
                 fixtures = resp.json().get("response", [])
             
-            # Si no hay fixtures pendientes hoy, traer los próximos 50 eventos
             if not fixtures:
                 url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
                 resp_next = await client.get(url_next, headers=HEADERS)
@@ -231,12 +230,11 @@ async def get_props():
                     f"({over_goles_count}/10 juegos sobre 2.5 goles)"
                 )
                 
-                matches_goles = construir_matches_forma(seed, home_name, away_name, 2.5, "GOLES")
-                matches_corners = construir_matches_forma(seed, home_name, away_name, 8.5, "CÓRNERS")
-                matches_tarjetas = construir_matches_forma(seed, home_name, away_name, 4.5, "TARJETAS")
-                matches_remates = construir_matches_forma(seed, home_name, away_name, 9.5, "REMATES")
+                matches_goles = construir_matches_forma(seed, 2.5, "GOLES")
+                matches_corners = construir_matches_forma(seed, 8.5, "CÓRNERS")
+                matches_tarjetas = construir_matches_forma(seed, 4.5, "TARJETAS")
+                matches_remates = construir_matches_forma(seed, 9.5, "REMATES")
                 
-                # Asignación de Alto Valor: siempre incluye los partidos con fiabilidad >= 60%
                 es_alto_valor = bool(calc_goles["fiabilidad"] >= 60 or calc_corners["fiabilidad"] >= 65)
                 
                 partidos_consolidados.append({

@@ -6,38 +6,47 @@ from datetime import datetime, timezone
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Flag & UI Precision Core")
+app = FastAPI(title="S2S Sigma Engine - Clean Unicode Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 EPSILON = 1e-6
 
-# Mapeo de Países a Banderas Emoji y Nombres Normalizados
+# Mapeo sanitizado con Unicode Escapes seguros
 BANDERA_MAP = {
-    "ALEMANIA": ("🇩🇪", "Alemania"), "GERMANY": ("🇩🇪", "Alemania"),
-    "ARABIA SAUDITA": ("🇸🇦", "Arabia Saudita"), "SAUDI ARABIA": ("🇸🇦", "Arabia Saudita"),
-    "ARGENTINA": ("🇦🇷", "Argentina"),
-    "BRASIL": ("🇧🇷", "Brasil"), "BRAZIL": ("🇧🇷", "Brasil"),
-    "COLOMBIA": ("🇨🇴", "Colombia"),
-    "ESPAÑA": ("🇪🇸", "España"), "SPAIN": ("🇪🇸", "España"),
-    "ESTADOS UNIDOS": ("🇺🇸", "Estados Unidos"), "USA": ("🇺🇸", "Estados Unidos"),
-    "INGLATERRA": ("🏴󠁧󠁢󠁥󠁮󠁧󠁿", "Inglaterra"), "ENGLAND": ("🏴󠁧󠁢󠁥󠁮󠁧󠁿", "Inglaterra"),
-    "ITALIA": ("🇮🇹", "Italia"), "ITALY": ("🇮🇹", "Italia"),
-    "PAÍSES BAJOS": ("🇳🇱", "Países Bajos"), "NETHERLANDS": ("🇳🇱", "Países Bajos"),
-    "URUGUAY": ("🇺🇾", "Uruguay"),
-    "VENEZUELA": ("🇻🇪", "Venezuela"),
-    "GLOBAL": ("🌐", "Internacional"), "WORLD": ("🌐", "Internacional")
+    "ALEMANIA": ("\U0001F1E9\U0001F1EA", "Alemania"),
+    "GERMANY": ("\U0001F1E9\U0001F1EA", "Alemania"),
+    "ARABIA SAUDITA": ("\U0001F1F8\U0001F1E6", "Arabia Saudita"),
+    "SAUDI ARABIA": ("\U0001F1F8\U0001F1E6", "Arabia Saudita"),
+    "ARGENTINA": ("\U0001F1E6\U0001F1F7", "Argentina"),
+    "BRASIL": ("\U0001F1E7\U0001F1F7", "Brasil"),
+    "BRAZIL": ("\U0001F1E7\U0001F1F7", "Brasil"),
+    "COLOMBIA": ("\U0001F1E8\U0001F1F4", "Colombia"),
+    "ESPA\u00d1A": ("\U0001F1EA\U0001F1F8", "Espana"),
+    "SPAIN": ("\U0001F1EA\U0001F1F8", "Espana"),
+    "ESTADOS UNIDOS": ("\U0001F1FA\U0001F1F8", "Estados Unidos"),
+    "USA": ("\U0001F1FA\U0001F1F8", "Estados Unidos"),
+    "INGLATERRA": ("\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F", "Inglaterra"),
+    "ENGLAND": ("\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F", "Inglaterra"),
+    "ITALIA": ("\U0001F1EE\U0001F1F9", "Italia"),
+    "ITALY": ("\U0001F1EE\U0001F1F9", "Italia"),
+    "PA\u00cdSES BAJOS": ("\U0001F1F3\U0001F1F1", "Paises Bajos"),
+    "NETHERLANDS": ("\U0001F1F3\U0001F1F1", "Paises Bajos"),
+    "URUGUAY": ("\U0001F1FA\U0001F1FE", "Uruguay"),
+    "VENEZUELA": ("\U0001F1FB\U0001F1EA", "Venezuela"),
+    "GLOBAL": ("\U0001F310", "Internacional"),
+    "WORLD": ("\U0001F310", "Internacional")
 }
 
 def obtener_pais_y_bandera(pais_raw: str, liga_raw: str) -> tuple:
-    pais_key = pais_raw.upper().strip()
+    pais_key = pais_raw.upper().strip() if pais_raw else ""
     if pais_key in BANDERA_MAP:
         return BANDERA_MAP[pais_key]
     for k, v in BANDERA_MAP.items():
         if k in liga_raw.upper():
             return v
-    return ("⚽", pais_raw.title() if pais_raw else "Internacional")
+    return ("\U000026BD", pais_raw.title() if pais_raw else "Internacional")
 
 def parsear_estado_hora(fixture_data: dict) -> dict:
     status = fixture_data.get("status", {})
@@ -83,7 +92,7 @@ def compilar_historial_equipo(seed: int, n: int = 20):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Engine Flag & Quality Active"}
+    return {"status": "ok", "service": "S2S Engine Clean Core Active"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -123,7 +132,6 @@ async def get_props():
                 seed_vis = int(hashlib.md5(f"{away_name}".encode()).hexdigest()[:8], 16)
                 seed_match = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:8], 16)
                 
-                # Variabilidad libre en goles
                 perfil = seed_match % 4
                 if perfil == 0:
                     lam_loc = round(1.7 + ((seed_loc % 7) / 10.0), 2)
@@ -157,12 +165,10 @@ async def get_props():
                 lam_tot = round(lam_loc + lam_vis, 2)
                 odd_calc = round(max(1.42, min(2.45, (1.0 / (conf_goles / 100.0)) * 0.92)), 2)
                 
-                # 1X2 Probabilístico
                 p_h = int(round((lam_loc / lam_tot) * 58 + 12))
                 p_a = int(round((lam_vis / lam_tot) * 52))
                 p_d = max(10, 100 - (p_h + p_a))
                 
-                # Marcador coherente
                 if is_over and merc_linea >= 2.5:
                     marcador_est = "2 - 1" if p_h >= p_a else "1 - 2"
                 elif is_over and merc_linea >= 1.5:
@@ -174,7 +180,6 @@ async def get_props():
                 else:
                     marcador_est = "1 - 1"
 
-                # Historiales independientes
                 f_home, _ = compilar_historial_equipo(seed_loc, 20)
                 f_away, _ = compilar_historial_equipo(seed_vis, 20)
                 f_h2h, _  = compilar_historial_equipo(seed_match, 5)
@@ -186,7 +191,6 @@ async def get_props():
                 for m in f_h2h:
                     m["cumple"] = m["valor"] > merc_linea if is_over else m["valor"] < merc_linea
 
-                # Ambos Anotan (BTTS)
                 recom_btts = "SÍ" if (lam_loc >= 1.0 and lam_vis >= 0.9) else "NO"
                 conf_btts = int(np.clip(64 + (seed_match % 18), 60, 82))
                 odd_btts = round(max(1.45, min(2.35, (1.0 / (conf_btts / 100.0)) * 0.92)), 2)
@@ -229,19 +233,16 @@ async def get_props():
                     "score_num": str(conf_goles),
                     "matchup_grade": "A" if conf_goles >= 74 else "B",
                     
-                    # Vectores por Mercado
                     "goles_matches": f_home,
                     "corners_matches": f_corners,
                     "tarjetas_matches": f_tarjetas,
                     "disparos_matches": f_disparos,
                     "btts_matches": f_btts,
                     
-                    # Vectores por Entidad
                     "home_matches_20": f_home,
                     "away_matches_20": f_away,
                     "h2h_matches": f_h2h,
                     
-                    # Métricas de Tabla
                     "hit_tend": f"{conf_goles}%",
                     "hit_l5": f"{hits_l5 * 20}%",
                     "hit_l10": f"{hits_l10 * 10}%",
@@ -250,7 +251,6 @@ async def get_props():
                     "hit_casa": "70%",
                     "hit_fora": "55%",
                     
-                    # Mercados Completos
                     "goles_label": merc_label, "goles_conf": float(conf_goles), "goles_odd": f"{odd_calc:.2f}",
                     "goles_proyeccion": str(lam_tot), "goles_promedio": float(lam_tot),
                     
@@ -274,5 +274,4 @@ async def get_props():
             print(f"[ERROR MAIN]: {e}")
             return []
 
-    # Orden Alfabético por País (A -> Z)
     return sorted(partidos_consolidados, key=lambda x: (x.get("pais", "Z"), x["is_live"], x["fiabilidad"]))

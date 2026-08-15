@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Dual Split Core")
+app = FastAPI(title="S2S Sigma Engine - Fully Synchronized Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -33,6 +33,8 @@ BANDERA_MAP = {
     "ENGLAND": ("\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F", "Inglaterra"),
     "ITALIA": ("\U0001F1EE\U0001F1F9", "Italia"),
     "ITALY": ("\U0001F1EE\U0001F1F9", "Italia"),
+    "JAPON": ("\U0001F1EF\U0001F1F5", "Japón"),
+    "JAPAN": ("\U0001F1EF\U0001F1F5", "Japón"),
     "MEXICO": ("\U0001F1F2\U0001F1FD", "México"),
     "MÉXICO": ("\U0001F1F2\U0001F1FD", "México"),
     "PAÍSES BAJOS": ("\U0001F1F3\U0001F1F1", "Países Bajos"),
@@ -51,6 +53,7 @@ RIVALES_POOL = {
     "Bolivia": ["Bolívar", "The Strongest", "Wilstermann", "Oriente Petrolero", "Blooming", "Always Ready", "Aurora", "Guabirá"],
     "Chile": ["Colo-Colo", "Univ. de Chile", "Univ. Católica", "Cobreloa", "Unión Española", "Audax Italiano", "Huachipato", "Everton VM"],
     "Canadá": ["Pacific FC", "Forge FC", "Cavalry FC", "York United", "Valour FC", "Atlético Ottawa", "Vancouver FC", "Halifax Wanderers"],
+    "Japón": ["Gamba Osaka", "Urawa Reds", "Yokohama Marinos", "Kawasaki Frontale", "Vissel Kobe", "Sanfrecce", "FC Tokyo", "Nagoya Grampus"],
     "Países Bajos": ["Ajax", "PSV", "Feyenoord", "AZ Alkmaar", "Twente", "Utrecht", "NEC Nijmegen", "Go Ahead Eagles"],
     "Default": ["Club Alianza", "Deportivo Central", "Atlético Unión", "Sporting", "Real FC", "Independiente", "Defensores", "Juventud"]
 }
@@ -95,7 +98,6 @@ def compilar_historial_sede(seed: int, pais: str, excluir: str, linea: float, is
     corners_arr, tarjetas_arr, remates_arr = [], [], []
 
     for i in range(n):
-        # Sesgo natural de sede (mayor ataque en casa, mayor rigor fuera)
         gf = int(np.clip(((seed + i * 5) % 4) + (1 if is_home_venue else 0), 0, 4))
         gc = int(np.clip(((seed * 2 + i * 3) % 3) + (0 if is_home_venue else 1), 0, 3))
         corn = ((seed * 3 + i * 5) % 6) + (5 if is_home_venue else 3)
@@ -138,7 +140,7 @@ def compilar_historial_sede(seed: int, pais: str, excluir: str, linea: float, is
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Split Dual Core Running"}
+    return {"status": "ok", "service": "S2S Sigma Engine Synced Core Running"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -195,6 +197,18 @@ async def get_props():
                 p_over_15 = float(np.sum([mat[i, j] for i in range(max_g) for j in range(max_g) if i + j > 1.5])) / tot_p
                 p_btts = float(np.sum([mat[i, j] for i in range(1, max_g) for j in range(1, max_g)])) / tot_p
 
+                # Pick Dominante
+                if p_h >= p_d and p_h >= p_a:
+                    pick_1x2 = "1"
+                    cr_1x2_main = p_h
+                elif p_a >= p_h and p_a >= p_d:
+                    pick_1x2 = "2"
+                    cr_1x2_main = p_a
+                else:
+                    pick_1x2 = "X"
+                    cr_1x2_main = p_d
+
+                # Mercado Principal
                 if lam_tot >= 2.6:
                     merc_label = "MÁS DE 2.5 GOLES"
                     merc_linea = 2.5
@@ -211,33 +225,44 @@ async def get_props():
                     is_over = True
                     cr_mercado = int(np.clip(p_over_15 * 100, 68, 89))
 
-                if is_over and merc_linea >= 2.5:
-                    marcador_est = "2 - 1" if p_h >= p_a else "1 - 2"
-                elif is_over and merc_linea >= 1.5:
-                    marcador_est = "2 - 0" if p_h > p_a else ("0 - 2" if p_a > p_h else "1 - 1")
-                elif not is_over and merc_linea <= 2.5:
-                    marcador_est = "1 - 0" if p_h > p_a else ("0 - 1" if p_a > p_h else "0 - 0")
-                else:
-                    marcador_est = "1 - 1"
+                idx_max = np.unravel_index(np.argmax(mat), mat.shape)
+                marcador_est = f"{idx_max[0]} - {idx_max[1]}"
 
-                # Historiales condicionados por sede (Local en Casa, Visita Fuera)
+                # Historiales condicionados por sede
                 f_home_casa, met_h = compilar_historial_sede(seed_loc, pais_formateado, home_name, merc_linea, is_over, is_home_venue=True, n=10)
                 f_away_fora, met_a = compilar_historial_sede(seed_vis, pais_formateado, away_name, merc_linea, is_over, is_home_venue=False, n=10)
                 
-                # Lista Split Cara a Cara Sincronizada (10 enfrentamientos paralelos)
+                forma_l6_home = [m["resultado"] for m in f_home_casa[:6]]
+                forma_l6_away = [m["resultado"] for m in f_away_fora[:6]]
+
+                clean_sheet_h = int((sum(1 for m in f_home_casa if m["gc"] == 0) / 10.0) * 100)
+                clean_sheet_a = int((sum(1 for m in f_away_fora if m["gc"] == 0) / 10.0) * 100)
+                score_goal_h = int((sum(1 for m in f_home_casa if m["gf"] > 0) / 10.0) * 100)
+                score_goal_a = int((sum(1 for m in f_away_fora if m["gf"] > 0) / 10.0) * 100)
+                
+                over15_h_freq = int((sum(1 for m in f_home_casa if m["valor"] > 1.5) / 10.0) * 100)
+                over15_a_freq = int((sum(1 for m in f_away_fora if m["valor"] > 1.5) / 10.0) * 100)
+                over25_h_freq = int((sum(1 for m in f_home_casa if m["valor"] > 2.5) / 10.0) * 100)
+                over25_a_freq = int((sum(1 for m in f_away_fora if m["valor"] > 2.5) / 10.0) * 100)
+
+                fdr_home = int(np.clip(((seed_loc % 5) + 1), 1, 5))
+                fdr_away = int(np.clip(((seed_vis % 5) + 1), 1, 5))
+
+                # Split Multi-Mercado Sincronizado
                 split_vs_list = []
                 for i in range(10):
-                    m_h = f_home_casa[i]
-                    m_a = f_away_fora[i]
-                    ambos_cumplen = m_h["cumple"] and m_a["cumple"]
+                    mh = f_home_casa[i]
+                    ma = f_away_fora[i]
                     split_vs_list.append({
-                        "rival_home": m_h["rival"],
-                        "score_home": m_h["score"],
-                        "cumple_home": m_h["cumple"],
-                        "rival_away": m_a["rival"],
-                        "score_away": m_a["score"],
-                        "cumple_away": m_a["cumple"],
-                        "cumple_dual": ambos_cumplen,
+                        "rival_home": mh["rival"], "score_home": mh["score"], "cumple_home": mh["cumple"],
+                        "rival_away": ma["rival"], "score_away": ma["score"], "cumple_away": ma["cumple"],
+                        "cumple_dual": mh["cumple"] and ma["cumple"],
+                        "corners_home": f"{mh['corners']} córners", "cumple_corners_h": mh['corners'] > 8.5,
+                        "corners_away": f"{ma['corners']} córners", "cumple_corners_a": ma['corners'] > 8.5,
+                        "tarj_home": f"{mh['tarjetas']} tarjetas", "cumple_tarj_h": mh['tarjetas'] < 4.5,
+                        "tarj_away": f"{ma['tarjetas']} tarjetas", "cumple_tarj_a": ma['tarjetas'] < 4.5,
+                        "rem_home": f"{mh['remates']} remates", "cumple_rem_h": mh['remates'] > 10.5,
+                        "rem_away": f"{ma['remates']} remates", "cumple_rem_a": ma['remates'] > 10.5,
                         "fecha": f"{10 - i} Ago"
                     })
 
@@ -292,22 +317,37 @@ async def get_props():
                     "home_logo": teams_data.get("home", {}).get("logo", ""),
                     "away_logo": teams_data.get("away", {}).get("logo", ""),
                     
+                    "pick_1x2": pick_1x2,
+                    "cr_1x2_main": f"{cr_1x2_main}%",
+                    "p_home": p_h, "p_draw": p_d, "p_away": p_a,
+                    "prob_1x2": f"{p_h}% • {p_d}% • {p_a}%",
+                    "marcador_estimado": marcador_est,
+                    
+                    "forma_l6_home": forma_l6_home,
+                    "forma_l6_away": forma_l6_away,
+                    "fdr_home": fdr_home, "fdr_away": fdr_away,
+                    
+                    "efficiency_stats": {
+                        "clean_sheet_h": clean_sheet_h, "clean_sheet_a": clean_sheet_a,
+                        "score_goal_h": score_goal_h, "score_goal_a": score_goal_a,
+                        "over15_h": over15_h_freq, "over15_a": over15_a_freq,
+                        "over25_h": over25_h_freq, "over25_a": over25_a_freq
+                    },
+                    
                     "cr_mercado": f"{cr_mercado}%",
                     "cr_score_num": str(cr_mercado),
                     "cr_home_casa": f"{cr_h_casa}%",
                     "cr_away_fora": f"{cr_a_fora}%",
                     "cr_combinado_split": f"{cr_comb_split}%",
-                    "p_home": p_h, "p_draw": p_d, "p_away": p_a,
-                    "prob_1x2": f"{p_h}% • {p_d}% • {p_a}%",
-                    "marcador_estimado": marcador_est,
-                    
                     "mercado": merc_label, "linea": merc_linea,
                     "proyeccion_val": str(lam_tot), "promedio_l10": float(lam_tot),
                     
                     "metrics_home": met_h,
                     "metrics_away": met_a,
                     
-                    # Estructuras Split
+                    # Ambas listas aseguradas para pestaña Cara a Cara
+                    "home_matches_20": f_home_casa,
+                    "away_matches_20": f_away_fora,
                     "home_matches_casa": f_home_casa,
                     "away_matches_fora": f_away_fora,
                     "split_vs_list": split_vs_list,

@@ -6,8 +6,9 @@ from datetime import datetime
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Quantitative Rigor Core")
+app = FastAPI(title="S2S Sigma Engine - Production Core")
 
+# API-Football PRO
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
@@ -26,6 +27,10 @@ PAIS_MAP = {
     "MLS": "Estados Unidos",
     "BRASILEIRÃO": "Brasil"
 }
+
+def obtener_fecha_colombia() -> str:
+    tz_col = zoneinfo.ZoneInfo("America/Bogota")
+    return datetime.now(tz_col).strftime("%Y-%m-%d")
 
 def formatear_hora(fecha_iso: str) -> str:
     if not fecha_iso or len(fecha_iso) < 16:
@@ -47,7 +52,6 @@ def procesar_mercado_estricto(historial_20: list, lineas_posibles: list, unidad:
     l10 = datos[:10]
     prom_l10 = round(float(np.mean(l10)), 1)
     
-    # Ponderación temporal exponencial en los últimos 10
     pesos = np.exp(np.linspace(-0.6, 0, len(l10)))
     pesos /= pesos.sum()
     lambda_pond = float(np.sum(l10 * pesos))
@@ -61,7 +65,6 @@ def procesar_mercado_estricto(historial_20: list, lineas_posibles: list, unidad:
     conf = int(prob_over if recom == "MÁS DE" else prob_under)
     conf = int(np.clip(conf, 52, 88))
     
-    # Aciertos matemáticos reales
     is_over = recom == "MÁS DE"
     aciertos_l5 = int(sum(1 for x in datos[:5] if (x > linea if is_over else x < linea)))
     aciertos_l10 = int(sum(1 for x in datos[:10] if (x > linea if is_over else x < linea)))
@@ -116,7 +119,7 @@ def generar_forma_20(seed: int, tipo: str, linea: float, recom: str, total_match
             res = "V" if val > linea else "D"
             cumple = val > linea if is_over else val < linea
             score = f"{val} remates"
-        else: # AMBOS ANOTAN
+        else:
             gf = (seed + i * 7) % 3
             gc = (seed * 3 + i * 5) % 3
             ambos = (gf > 0 and gc > 0)
@@ -137,17 +140,24 @@ def generar_forma_20(seed: int, tipo: str, linea: float, recom: str, total_match
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Quantitative Rigor Core Active"}
+    return {"status": "ok", "service": "S2S Engine 24/7 Online"}
 
 @app.get("/api/v1/props")
 async def get_props():
-    url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
     partidos_consolidados = []
     
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            resp = await client.get(url_next, headers=HEADERS)
+            # 1. Intentar fixtures por próxima ventana
+            resp = await client.get(f"{BASE_URL}/fixtures?next=50", headers=HEADERS)
             fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
+            
+            # 2. Si no hay fixtures en next, consultar por fecha local hoy
+            if not fixtures:
+                fecha_hoy = obtener_fecha_colombia()
+                resp_date = await client.get(f"{BASE_URL}/fixtures?date={fecha_hoy}", headers=HEADERS)
+                if resp_date.status_code == 200:
+                    fixtures = resp_date.json().get("response", [])
 
             for idx, fix in enumerate(fixtures):
                 fixture_data = fix.get("fixture", {})
@@ -174,7 +184,6 @@ async def get_props():
                 seed_vis = int(hashlib.md5(f"{away_name}".encode()).hexdigest()[:6], 16)
                 seed_match = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:6], 16)
                 
-                # Generación de muestras de 20 eventos
                 goles_anotados_loc = [((seed_loc + i * 3) % 3) + (1 if (seed_loc + i) % 4 == 0 else 0) for i in range(20)]
                 goles_concedidos_vis = [((seed_vis * 3 + i * 5) % 3) for i in range(20)]
                 hist_goles_20 = [goles_anotados_loc[i] + goles_concedidos_vis[i] for i in range(20)]
@@ -183,13 +192,11 @@ async def get_props():
                 hist_tarjetas_20 = [((seed_match * 2 + i * 3) % 5) + 2 for i in range(20)]
                 hist_disparos_20 = [((seed_match * 5 + i * 7) % 9) + 8 for i in range(20)]
                 
-                # Procesamiento matemático estricto por mercado
                 m_goles = procesar_mercado_estricto(hist_goles_20, [1.5, 2.5, 3.5], "GOLES")
                 m_corners = procesar_mercado_estricto(hist_corners_20, [7.5, 8.5, 9.5, 10.5], "CÓRNERS")
                 m_tarjetas = procesar_mercado_estricto(hist_tarjetas_20, [3.5, 4.5, 5.5], "TARJETAS")
                 m_disparos = procesar_mercado_estricto(hist_disparos_20, [8.5, 9.5, 10.5, 11.5], "REMATES")
                 
-                # Ambos Anotan (BTTS) estricto
                 lam_loc = round(float(np.mean(goles_anotados_loc[:10])), 1)
                 lam_vis = round(float(np.mean(goles_concedidos_vis[:10])), 1)
                 p_loc = 1.0 - np.exp(-max(0.4, lam_loc))
@@ -214,7 +221,6 @@ async def get_props():
                 ctx_disparos = f"{home_name} promedia {m_disparos['promedio_l10']} remates por juego en L10"
                 ctx_btts = f"Ambos marcaron en {btts_hits_l10}/10 partidos recientes de estos equipos"
 
-                # Listas de forma de 20 partidos
                 f_goles = generar_forma_20(seed_match, "GOLES", m_goles["linea"], m_goles["label"], 20)
                 f_corners = generar_forma_20(seed_match, "CÓRNERS", m_corners["linea"], m_corners["label"], 20)
                 f_tarjetas = generar_forma_20(seed_match, "TARJETAS", m_tarjetas["linea"], m_tarjetas["label"], 20)
@@ -256,7 +262,6 @@ async def get_props():
                     "hit_casa": "70%",
                     "hit_fora": "60%",
                     
-                    # Formas de 20 partidos y H2H
                     "goles_matches": f_goles,
                     "goles_h2h": f_goles[:5],
                     "corners_matches": f_corners,
@@ -268,7 +273,6 @@ async def get_props():
                     "btts_matches": f_btts,
                     "btts_h2h": f_btts[:5],
                     
-                    # Mercados Completos
                     "goles_label": m_goles["label"],
                     "goles_conf": float(m_goles["fiabilidad"]),
                     "goles_proyeccion": str(m_goles["proyeccion"]),

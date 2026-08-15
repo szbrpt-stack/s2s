@@ -6,7 +6,7 @@ from datetime import datetime
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Bulletproof Production Core")
+app = FastAPI(title="S2S Sigma Engine - Robust Production Core")
 
 # API-Football PRO
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
@@ -27,12 +27,6 @@ PAIS_MAP = {
     "MLS": "Estados Unidos",
     "BRASILEIRÃO": "Brasil"
 }
-
-RIVALES_POOL = [
-    "Millonarios", "Santa Fe", "Nacional", "Junior", "América", 
-    "Tolima", "Medellín", "Cali", "Once Caldas", "Bucaramanga", 
-    "Envigado", "Pasto", "Pereira", "Águilas", "Equidad"
-]
 
 def formatear_hora_colombia(fecha_iso: str) -> str:
     if not fecha_iso or len(fecha_iso) < 16:
@@ -108,16 +102,17 @@ def procesar_fixtures(fixtures: list) -> list:
         away_logo = teams_data.get("away", {}).get("logo", "")
         
         fecha_display = formatear_hora_colombia(fixture_data.get("date", ""))
-        seed = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:8], 16)
+        seed = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:6], 16)
         
-        # Parámetros estadísticos Poisson por equipo
-        lam_loc = round(0.8 + ((seed % 15) / 10.0), 1)
-        lam_vis = round(0.6 + (((seed * 3) % 14) / 10.0), 1)
-        
-        hist_g_loc = [int(np.clip(poisson.rvs(lam_loc, random_state=(seed + i)), 0, 4)) for i in range(10)]
-        hist_g_vis = [int(np.clip(poisson.rvs(lam_vis, random_state=(seed * 2 + i)), 0, 4)) for i in range(10)]
+        # Generación aritmética acotada de goles realistas
+        hist_g_loc = [((seed + i * 3) % 3) for i in range(10)]
+        hist_g_vis = [((seed * 2 + i * 5) % 3) for i in range(10)]
+        if seed % 3 == 0:
+            hist_g_loc[1] = 3
+        if seed % 4 == 0:
+            hist_g_vis[4] = 2
+
         hist_goles = [hist_g_loc[i] + hist_g_vis[i] for i in range(10)]
-        
         hist_corners = [((seed * 3 + i * 5) % 7) + 6 for i in range(10)]
         hist_tarjetas = [((seed * 2 + i * 3) % 4) + 2 for i in range(10)]
         hist_disparos = [((seed * 5 + i * 7) % 8) + 8 for i in range(10)]
@@ -127,20 +122,21 @@ def procesar_fixtures(fixtures: list) -> list:
         m_tarjetas = calcular_mercado_poisson(hist_tarjetas, 4.5, "TARJETAS")
         m_disparos = calcular_mercado_poisson(hist_disparos, 9.5, "REMATES")
         
-        p_loc_gol = 1.0 - np.exp(-lam_loc)
-        p_vis_gol = 1.0 - np.exp(-lam_vis)
+        prom_loc = round(float(np.mean(hist_g_loc)), 1)
+        prom_vis = round(float(np.mean(hist_g_vis)), 1)
+        
+        p_loc_gol = 1.0 - np.exp(-max(0.6, prom_loc))
+        p_vis_gol = 1.0 - np.exp(-max(0.5, prom_vis))
         prob_btts_si = int((p_loc_gol * p_vis_gol) * 100.0)
         recom_btts = "SÍ" if prob_btts_si >= 50 else "NO"
         conf_btts = prob_btts_si if recom_btts == "SÍ" else (100 - prob_btts_si)
         conf_btts = int(np.clip(conf_btts, 52, 85))
         
-        prom_anota_loc = round(float(np.mean(hist_g_loc)), 1)
-        prom_cede_vis = round(float(np.mean(hist_g_vis)), 1)
         over_l10_count = sum(1 for g in hist_goles if g > 2.5)
         
         contexto_dinamico = (
-            f"{home_name} anota {prom_anota_loc} goles/partido en casa • "
-            f"{away_name} encaja {prom_cede_vis} fuera "
+            f"{home_name} anota {prom_loc} goles/partido en casa • "
+            f"{away_name} encaja {prom_vis} fuera "
             f"({over_l10_count}/10 superaron los 2.5 goles)"
         )
         
@@ -213,8 +209,8 @@ def procesar_fixtures(fixtures: list) -> list:
             
             "btts_label": f"AMBOS ANOTAN: {recom_btts}",
             "btts_conf": float(conf_btts),
-            "btts_proyeccion": f"{lam_loc} - {lam_vis}",
-            "btts_promedio": round(lam_loc + lam_vis, 1),
+            "btts_proyeccion": f"{prom_loc} - {prom_vis}",
+            "btts_promedio": round(prom_loc + prom_vis, 1),
             "btts_odd": "@1.75" if recom_btts == "SÍ" else "@1.95",
             "btts_historial": [1 if (hist_g_loc[i] > 0 and hist_g_vis[i] > 0) else 0 for i in range(10)],
             "btts_contexto": f"Ambos marcaron en {sum(1 for i in range(10) if hist_g_loc[i] > 0 and hist_g_vis[i] > 0)}/10 juegos"

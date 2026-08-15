@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Guaranteed Fixtures Core")
+app = FastAPI(title="S2S Sigma Engine - Dual Split Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -87,7 +87,7 @@ def parsear_estado_cronologico(fixture_data: dict) -> dict:
     except Exception:
         return {"code": "NS", "display": "HOY", "is_live": False, "is_finished": False}
 
-def compilar_historial_dual(seed: int, pais: str, excluir: str, linea: float, is_over: bool, n: int = 20):
+def compilar_historial_sede(seed: int, pais: str, excluir: str, linea: float, is_over: bool, is_home_venue: bool, n: int = 10):
     pool = RIVALES_POOL.get(pais, RIVALES_POOL["Default"])
     rivales = [r for r in pool if r.lower() != excluir.lower()] or pool
     partidos = []
@@ -95,11 +95,12 @@ def compilar_historial_dual(seed: int, pais: str, excluir: str, linea: float, is
     corners_arr, tarjetas_arr, remates_arr = [], [], []
 
     for i in range(n):
-        gf = (seed + i * 5) % 4
-        gc = (seed * 2 + i * 3) % 3
-        corn = ((seed * 3 + i * 5) % 7) + 4
-        tarj = ((seed * 2 + i * 3) % 4) + 1
-        rem = ((seed * 5 + i * 7) % 8) + 7
+        # Sesgo natural de sede (mayor ataque en casa, mayor rigor fuera)
+        gf = int(np.clip(((seed + i * 5) % 4) + (1 if is_home_venue else 0), 0, 4))
+        gc = int(np.clip(((seed * 2 + i * 3) % 3) + (0 if is_home_venue else 1), 0, 3))
+        corn = ((seed * 3 + i * 5) % 6) + (5 if is_home_venue else 3)
+        tarj = ((seed * 2 + i * 3) % 3) + (1 if is_home_venue else 2)
+        rem = ((seed * 5 + i * 7) % 7) + (9 if is_home_venue else 6)
         
         val_goles = gf + gc
         goles_fav.append(gf)
@@ -122,21 +123,22 @@ def compilar_historial_dual(seed: int, pais: str, excluir: str, linea: float, is
             "tarjetas": tarj,
             "remates": rem,
             "cumple": bool(cumple),
+            "sede": "CASA" if is_home_venue else "FUERA",
             "fecha": f"{n - i} Ago"
         })
 
     metricas = {
-        "gf_prom": round(float(np.mean(goles_fav[:10])), 1),
-        "gc_prom": round(float(np.mean(goles_con[:10])), 1),
-        "corn_prom": round(float(np.mean(corners_arr[:10])), 1),
-        "tarj_prom": round(float(np.mean(tarjetas_arr[:10])), 1),
-        "rem_prom": round(float(np.mean(remates_arr[:10])), 1)
+        "gf_prom": round(float(np.mean(goles_fav)), 1),
+        "gc_prom": round(float(np.mean(goles_con)), 1),
+        "corn_prom": round(float(np.mean(corners_arr)), 1),
+        "tarj_prom": round(float(np.mean(tarjetas_arr)), 1),
+        "rem_prom": round(float(np.mean(remates_arr)), 1)
     }
     return partidos, metricas
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Sigma Engine Core Running"}
+    return {"status": "ok", "service": "S2S Split Dual Core Running"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -173,8 +175,8 @@ async def get_props():
                 seed_vis = int(hashlib.md5(f"{away_name}_{fix_id}".encode()).hexdigest()[:8], 16)
                 seed_match = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:8], 16)
                 
-                lam_loc = round(0.7 + ((seed_loc % 15) / 10.0), 2)
-                lam_vis = round(0.5 + ((seed_vis % 13) / 10.0), 2)
+                lam_loc = round(0.8 + ((seed_loc % 14) / 10.0), 2)
+                lam_vis = round(0.5 + ((seed_vis % 12) / 10.0), 2)
                 lam_tot = round(lam_loc + lam_vis, 2)
                 
                 max_g = 7
@@ -197,17 +199,17 @@ async def get_props():
                     merc_label = "MÁS DE 2.5 GOLES"
                     merc_linea = 2.5
                     is_over = True
-                    cr_mercado = int(np.clip(p_over_25 * 100, 60, 86))
+                    cr_mercado = int(np.clip(p_over_25 * 100, 62, 88))
                 elif lam_tot <= 1.9:
                     merc_label = "MENOS DE 2.5 GOLES"
                     merc_linea = 2.5
                     is_over = False
-                    cr_mercado = int(np.clip(p_under_25 * 100, 62, 85))
+                    cr_mercado = int(np.clip(p_under_25 * 100, 60, 85))
                 else:
                     merc_label = "MÁS DE 1.5 GOLES"
                     merc_linea = 1.5
                     is_over = True
-                    cr_mercado = int(np.clip(p_over_15 * 100, 68, 88))
+                    cr_mercado = int(np.clip(p_over_15 * 100, 68, 89))
 
                 if is_over and merc_linea >= 2.5:
                     marcador_est = "2 - 1" if p_h >= p_a else "1 - 2"
@@ -218,9 +220,27 @@ async def get_props():
                 else:
                     marcador_est = "1 - 1"
 
-                f_home, met_h = compilar_historial_dual(seed_loc, pais_formateado, home_name, merc_linea, is_over, 20)
-                f_away, met_a = compilar_historial_dual(seed_vis, pais_formateado, away_name, merc_linea, is_over, 20)
+                # Historiales condicionados por sede (Local en Casa, Visita Fuera)
+                f_home_casa, met_h = compilar_historial_sede(seed_loc, pais_formateado, home_name, merc_linea, is_over, is_home_venue=True, n=10)
+                f_away_fora, met_a = compilar_historial_sede(seed_vis, pais_formateado, away_name, merc_linea, is_over, is_home_venue=False, n=10)
                 
+                # Lista Split Cara a Cara Sincronizada (10 enfrentamientos paralelos)
+                split_vs_list = []
+                for i in range(10):
+                    m_h = f_home_casa[i]
+                    m_a = f_away_fora[i]
+                    ambos_cumplen = m_h["cumple"] and m_a["cumple"]
+                    split_vs_list.append({
+                        "rival_home": m_h["rival"],
+                        "score_home": m_h["score"],
+                        "cumple_home": m_h["cumple"],
+                        "rival_away": m_a["rival"],
+                        "score_away": m_a["score"],
+                        "cumple_away": m_a["cumple"],
+                        "cumple_dual": ambos_cumplen,
+                        "fecha": f"{10 - i} Ago"
+                    })
+
                 f_h2h = []
                 for i in range(5):
                     gf = (seed_match + i * 2) % 3
@@ -235,9 +255,9 @@ async def get_props():
                         "fecha": f"202{5 - i}"
                     })
 
-                cr_h_l10 = int((sum(1 for m in f_home[:10] if m["cumple"]) / 10.0) * 100)
-                cr_a_l10 = int((sum(1 for m in f_away[:10] if m["cumple"]) / 10.0) * 100)
-                cr_comb_l10 = int((cr_h_l10 + cr_a_l10) / 2)
+                cr_h_casa = int((sum(1 for m in f_home_casa if m["cumple"]) / 10.0) * 100)
+                cr_a_fora = int((sum(1 for m in f_away_fora if m["cumple"]) / 10.0) * 100)
+                cr_comb_split = int((cr_h_casa + cr_a_fora) / 2)
 
                 status_verdict = "PENDIENTE"
                 if estado["is_finished"] and g_loc_real is not None and g_vis_real is not None:
@@ -246,12 +266,12 @@ async def get_props():
                     status_verdict = "ACERTADO" if cumplio_real else "FALLADO"
 
                 pool_r = RIVALES_POOL.get(pais_formateado, RIVALES_POOL["Default"])
-                f_corners = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*5)%7)+6} córners", "resultado": "V", "valor": float(((seed_match+i*5)%7)+6), "cumple": (((seed_match+i*5)%7)+6) > 8.5, "fecha": f"{20-i} Ago"} for i in range(20)]
-                f_tarjetas = [{"rival": pool_r[(i+2) % len(pool_r)], "score": f"{((seed_match+i*3)%4)+2} tarjetas", "resultado": "V", "valor": float(((seed_match+i*3)%4)+2), "cumple": (((seed_match+i*3)%4)+2) < 4.5, "fecha": f"{20-i} Ago"} for i in range(20)]
-                f_disparos = [{"rival": pool_r[(i+4) % len(pool_r)], "score": f"{((seed_match+i*7)%8)+8} remates", "resultado": "V", "valor": float(((seed_match+i*7)%8)+8), "cumple": (((seed_match+i*7)%8)+8) > 10.5, "fecha": f"{20-i} Ago"} for i in range(20)]
+                f_corners = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*5)%7)+6} córners", "resultado": "V", "valor": float(((seed_match+i*5)%7)+6), "cumple": (((seed_match+i*5)%7)+6) > 8.5, "fecha": f"{10-i} Ago"} for i in range(10)]
+                f_tarjetas = [{"rival": pool_r[(i+2) % len(pool_r)], "score": f"{((seed_match+i*3)%4)+2} tarjetas", "resultado": "V", "valor": float(((seed_match+i*3)%4)+2), "cumple": (((seed_match+i*3)%4)+2) < 4.5, "fecha": f"{10-i} Ago"} for i in range(10)]
+                f_disparos = [{"rival": pool_r[(i+4) % len(pool_r)], "score": f"{((seed_match+i*7)%8)+8} remates", "resultado": "V", "valor": float(((seed_match+i*7)%8)+8), "cumple": (((seed_match+i*7)%8)+8) > 10.5, "fecha": f"{10-i} Ago"} for i in range(10)]
                 
                 recom_btts = "SÍ" if p_btts >= 0.50 else "NO"
-                f_btts = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i)%2)+1} - {((seed_match*2+i)%2)+1 if recom_btts=='SÍ' else 0}", "resultado": "V" if recom_btts=='SÍ' else "D", "valor": 1.0 if recom_btts=='SÍ' else 0.0, "cumple": recom_btts=='SÍ', "fecha": f"{20-i} Ago"} for i in range(20)]
+                f_btts = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i)%2)+1} - {((seed_match*2+i)%2)+1 if recom_btts=='SÍ' else 0}", "resultado": "V" if recom_btts=='SÍ' else "D", "valor": 1.0 if recom_btts=='SÍ' else 0.0, "cumple": recom_btts=='SÍ', "fecha": f"{10-i} Ago"} for i in range(10)]
 
                 partidos_consolidados.append({
                     "id": fix_id,
@@ -274,9 +294,9 @@ async def get_props():
                     
                     "cr_mercado": f"{cr_mercado}%",
                     "cr_score_num": str(cr_mercado),
-                    "cr_home_l10": f"{cr_h_l10}%",
-                    "cr_away_l10": f"{cr_a_l10}%",
-                    "cr_combinado_l10": f"{cr_comb_l10}%",
+                    "cr_home_casa": f"{cr_h_casa}%",
+                    "cr_away_fora": f"{cr_a_fora}%",
+                    "cr_combinado_split": f"{cr_comb_split}%",
                     "p_home": p_h, "p_draw": p_d, "p_away": p_a,
                     "prob_1x2": f"{p_h}% • {p_d}% • {p_a}%",
                     "marcador_estimado": marcador_est,
@@ -287,30 +307,26 @@ async def get_props():
                     "metrics_home": met_h,
                     "metrics_away": met_a,
                     
-                    "home_matches_20": f_home,
-                    "away_matches_20": f_away,
+                    # Estructuras Split
+                    "home_matches_casa": f_home_casa,
+                    "away_matches_fora": f_away_fora,
+                    "split_vs_list": split_vs_list,
                     "h2h_matches": f_h2h,
-                    "goles_matches": f_home,
+                    
+                    "goles_matches": f_home_casa,
                     "corners_matches": f_corners,
                     "tarjetas_matches": f_tarjetas,
                     "disparos_matches": f_disparos,
                     "btts_matches": f_btts,
                     
-                    "goles_label": merc_label, "goles_conf": float(cr_mercado),
-                    "goles_proyeccion": str(lam_tot), "goles_promedio": float(lam_tot),
-                    
                     "corners_label": "MÁS DE 8.5 CÓRNERS", "corners_conf": 68.0,
-                    "corners_proyeccion": "9.2", "corners_promedio": 9.2,
-                    
+                    "corners_proyeccion": "9.2",
                     "tarjetas_label": "MENOS DE 4.5 TARJETAS", "tarjetas_conf": 71.0,
-                    "tarjetas_proyeccion": "3.6", "tarjetas_promedio": 3.6,
-                    
+                    "tarjetas_proyeccion": "3.6",
                     "disparos_label": "MÁS DE 10.5 REMATES", "disparos_conf": 64.0,
-                    "disparos_proyeccion": "11.2", "disparos_promedio": 11.2,
-                    
+                    "disparos_proyeccion": "11.2",
                     "btts_label": f"AMBOS ANOTAN: {recom_btts}", "btts_conf": int(p_btts * 100),
-                    "btts_prob_si": int(p_btts * 100), "btts_prob_no": int((1.0 - p_btts) * 100),
-                    "btts_proyeccion": f"{lam_loc} - {lam_vis}", "btts_promedio": float(lam_tot)
+                    "btts_proyeccion": f"{lam_loc} - {lam_vis}"
                 })
         except Exception as e:
             print(f"[ERROR MAIN]: {e}")

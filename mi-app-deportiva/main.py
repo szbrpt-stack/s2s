@@ -2,16 +2,27 @@ from fastapi import FastAPI
 import httpx
 import numpy as np
 from scipy.stats import poisson
-from datetime import datetime, timezone
+from datetime import datetime
 import zoneinfo
-import hashlib
+from typing import Dict, List, Any
+import asyncio
 
-app = FastAPI(title="S2S Sigma Engine - Metrologically Rigorous Core")
+app = FastAPI(title="S2S Sigma Engine - Formal Statistical & Deep API Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 EPSILON = 1e-6
+RHO_DIXON_COLES = -0.13
+
+# Medias de referencia internacional
+MU_GOLES_LOCAL = 1.45
+MU_GOLES_VISITA = 1.15
+MU_CORNERS_LIGA = 9.80
+MU_TARJETAS_LIGA = 4.30
+
+# Caché en memoria para optimizar peticiones
+CACHE_EQUIPOS: Dict[int, List[Dict[str, Any]]] = {}
 
 BANDERA_MAP = {
     "ARGENTINA": ("\U0001F1E6\U0001F1F7", "Argentina"),
@@ -47,17 +58,6 @@ BANDERA_MAP = {
     "GLOBAL": ("\U0001F310", "Internacional")
 }
 
-RIVALES_REALES = {
-    "Argentina": ["Sarmiento", "Gimnasia LP", "Talleres", "River Plate", "Argentinos Jrs", "Unión", "Boca Juniors", "Vélez Sarsfield", "Lanús", "Estudiantes LP"],
-    "Brasil": ["São Paulo", "Palmeiras", "Corinthians", "Santos", "Grêmio", "Flamengo", "Internacional", "Atlético Mineiro", "Fluminense", "Botafogo"],
-    "Bolivia": ["Bolívar", "The Strongest", "Wilstermann", "Oriente Petrolero", "Blooming", "Always Ready", "Aurora", "Guabirá", "Real Tomayapo", "Nacional Potosí"],
-    "Chile": ["Colo-Colo", "Univ. de Chile", "Univ. Católica", "Cobreloa", "Unión Española", "Audax Italiano", "Huachipato", "Everton VM", "Palestino", "Cobresal"],
-    "Canadá": ["Forge FC", "Cavalry FC", "York United", "Valour FC", "Atlético Ottawa", "Vancouver FC", "Pacific FC", "Halifax Wanderers"],
-    "Japón": ["Gamba Osaka", "Urawa Reds", "Yokohama Marinos", "Kawasaki Frontale", "Vissel Kobe", "Sanfrecce", "FC Tokyo", "Nagoya Grampus"],
-    "Países Bajos": ["Ajax", "PSV", "Feyenoord", "AZ Alkmaar", "Twente", "Utrecht", "NEC Nijmegen", "Go Ahead Eagles"],
-    "Default": ["Club Alianza", "Deportivo Central", "Atlético Unión", "Sporting", "Real FC", "Independiente", "Defensores", "Juventud"]
-}
-
 def obtener_pais_y_bandera(pais_raw: str, liga_raw: str) -> tuple:
     pais_key = pais_raw.upper().strip() if pais_raw else ""
     if pais_key in BANDERA_MAP:
@@ -90,16 +90,105 @@ def parsear_estado_cronologico(fixture_data: dict) -> dict:
     except Exception:
         return {"code": "NS", "display": "HOY", "is_live": False, "is_finished": False}
 
+def tau_dixon_coles(x: int, y: int, lambda_h: float, lambda_a: float, rho: float = RHO_DIXON_COLES) -> float:
+    if x == 0 and y == 0:
+        return 1.0 - (lambda_h * lambda_a * rho)
+    elif x == 1 and y == 0:
+        return 1.0 + (lambda_a * rho)
+    elif x == 0 and y == 1:
+        return 1.0 + (lambda_h * rho)
+    elif x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+async def fetch_historial_profundo(client: httpx.AsyncClient, team_id: int) -> List[Dict[str, Any]]:
+    if team_id in CACHE_EQUIPOS:
+        return CACHE_EQUIPOS[team_id]
+        
+    url = f"{BASE_URL}/fixtures?team={team_id}&last=10&status=FT"
+    partidos_procesados = []
+    try:
+        r = await client.get(url, headers=HEADERS, timeout=12.0)
+        if r.status_code == 200:
+            fixtures = r.json().get("response", [])
+            for fix in fixtures:
+                fix_id = fix.get("fixture", {}).get("id")
+                teams = fix.get("teams", {})
+                goals = fix.get("goals", {})
+                fix_info = fix.get("fixture", {})
+                
+                is_home = teams.get("home", {}).get("id") == team_id
+                rival = teams.get("away", {}).get("name") if is_home else teams.get("home", {}).get("name")
+                
+                gf = goals.get("home") if is_home else goals.get("away")
+                gc = goals.get("away") if is_home else goals.get("home")
+                gf = gf if gf is not None else 0
+                gc = gc if gc is not None else 0
+                
+                url_stats = f"{BASE_URL}/fixtures/statistics?fixture={fix_id}"
+                corn_fav, corn_con = 5, 4
+                tarj_prop, tarj_prov = 2, 2
+                rem_fav, rem_con = 11, 10
+                
+                try:
+                    r_stats = await client.get(url_stats, headers=HEADERS, timeout=6.0)
+                    if r_stats.status_code == 200:
+                        stats_resp = r_stats.json().get("response", [])
+                        for team_stat in stats_resp:
+                            t_id = team_stat.get("team", {}).get("id")
+                            s_list = {item["type"]: item["value"] for item in team_stat.get("statistics", [])}
+                            
+                            c_val = s_list.get("Corner Kicks") or 0
+                            y_card = s_list.get("Yellow Cards") or 0
+                            r_card = s_list.get("Red Cards") or 0
+                            t_shots = s_list.get("Total Shots") or 0
+                            
+                            if t_id == team_id:
+                                corn_fav = int(c_val)
+                                tarj_prop = int(y_card) + (int(r_card) * 2)
+                                rem_fav = int(t_shots)
+                            else:
+                                corn_con = int(c_val)
+                                tarj_prov = int(y_card) + (int(r_card) * 2)
+                                rem_con = int(t_shots)
+                except Exception:
+                    pass
+
+                dt_str = fix_info.get("date", "")
+                try:
+                    fecha_str = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).strftime("%d/%m")
+                except Exception:
+                    fecha_str = "Reciente"
+                
+                res = "V" if gf > gc else ("E" if gf == gc else "D")
+                
+                partidos_procesados.append({
+                    "rival": rival or "Rival Oficial",
+                    "score": f"{gf} - {gc}",
+                    "resultado": res,
+                    "gf": gf, "gc": gc,
+                    "corn_fav": corn_fav, "corn_con": corn_con,
+                    "tarj_prop": tarj_prop, "tarj_prov": tarj_prov,
+                    "rem_fav": rem_fav, "rem_con": rem_con,
+                    "sede": "CASA" if is_home else "FUERA",
+                    "fecha": fecha_str
+                })
+    except Exception as e:
+        print(f"[API ERROR FETCH TEAM {team_id}]: {e}")
+        
+    CACHE_EQUIPOS[team_id] = partidos_procesados
+    return partidos_procesados
+
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Rigorous Metrology Core Running"}
+    return {"status": "ok", "service": "S2S Formal Metrology Core Operational"}
 
 @app.get("/api/v1/props")
 async def get_props():
-    url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
+    url_next = f"{BASE_URL}/fixtures?next=30&timezone=America/Bogota"
     partidos_consolidados = []
     
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.get(url_next, headers=HEADERS)
             fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
@@ -117,181 +206,172 @@ async def get_props():
                 bandera_emoji, pais_formateado = obtener_pais_y_bandera(pais_raw, liga_nombre_raw)
                 liga_agrupada = f"{bandera_emoji}  {pais_formateado} • {liga_nombre_raw.title()}"
                 
+                home_id = teams_data.get("home", {}).get("id", 0)
+                away_id = teams_data.get("away", {}).get("id", 0)
                 home_name = teams_data.get("home", {}).get("name", "Local")
                 away_name = teams_data.get("away", {}).get("name", "Visita")
                 
-                seed_loc = int(hashlib.md5(f"{home_name}_{fix_id}".encode()).hexdigest()[:8], 16)
-                seed_vis = int(hashlib.md5(f"{away_name}_{fix_id}".encode()).hexdigest()[:8], 16)
-                seed_match = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:8], 16)
+                f_home_real = await fetch_historial_profundo(client, home_id)
+                f_away_real = await fetch_historial_profundo(client, away_id)
                 
-                # 1. PARÁMETROS REALES DE ATAQUE VS DEFENSA (Goles)
-                gf_h_base = round(1.2 + ((seed_loc % 8) / 10.0), 1)
-                gc_h_base = round(0.7 + ((seed_loc % 6) / 10.0), 1)
-                gf_a_base = round(0.9 + ((seed_vis % 7) / 10.0), 1)
-                gc_a_base = round(1.2 + ((seed_vis % 8) / 10.0), 1)
+                if not f_home_real or not f_away_real:
+                    continue
+
+                # 1. Normalización de Fuerzas Relativas (Goles)
+                gf_h_mean = np.mean([m["gf"] for m in f_home_real])
+                gc_h_mean = np.mean([m["gc"] for m in f_home_real])
+                gf_a_mean = np.mean([m["gf"] for m in f_away_real])
+                gc_a_mean = np.mean([m["gc"] for m in f_away_real])
                 
-                lam_loc = round((gf_h_base + gc_a_base) / 2.0, 2)
-                lam_vis = round((gf_a_base + gc_h_base) / 2.0, 2)
-                lam_tot = round(lam_loc + lam_vis, 2)
+                alpha_h = max(0.2, gf_h_mean / MU_GOLES_LOCAL)
+                beta_h = max(0.2, gc_h_mean / MU_GOLES_VISITA)
+                alpha_a = max(0.2, gf_a_mean / MU_GOLES_VISITA)
+                beta_a = max(0.2, gc_a_mean / MU_GOLES_LOCAL)
                 
-                # Matriz Bivariada de Poisson
+                lambda_h = round(alpha_h * beta_a * MU_GOLES_LOCAL, 2)
+                lambda_a = round(alpha_a * beta_h * MU_GOLES_VISITA, 2)
+                lambda_tot = round(lambda_h + lambda_a, 2)
+                
                 max_g = 7
                 mat = np.zeros((max_g, max_g))
-                for i in range(max_g):
-                    for j in range(max_g):
-                        mat[i, j] = poisson.pmf(i, lam_loc) * poisson.pmf(j, lam_vis)
+                for x in range(max_g):
+                    for y in range(max_g):
+                        p_base = (poisson.pmf(x, lambda_h) * poisson.pmf(y, lambda_a))
+                        mat[x, y] = p_base * tau_dixon_coles(x, y, lambda_h, lambda_a)
                         
                 tot_p = max(float(np.sum(mat)), EPSILON)
-                p_h = int(round(float(np.sum(np.tril(mat, -1))) / tot_p * 100))
-                p_d = int(round(float(np.sum(np.diag(mat))) / tot_p * 100))
+                mat /= tot_p
+                
+                p_h = int(round(float(np.sum(np.tril(mat, -1))) * 100))
+                p_d = int(round(float(np.sum(np.diag(mat))) * 100))
                 p_a = max(1, 100 - (p_h + p_d))
                 
-                p_over_25 = float(np.sum([mat[i, j] for i in range(max_g) for j in range(max_g) if i + j > 2.5])) / tot_p
-                p_under_25 = 1.0 - p_over_25
-                p_over_15 = float(np.sum([mat[i, j] for i in range(max_g) for j in range(max_g) if i + j > 1.5])) / tot_p
-                p_under_15 = 1.0 - p_over_15
-                p_btts = float(np.sum([mat[i, j] for i in range(1, max_g) for j in range(1, max_g)])) / tot_p
+                p_o25 = float(np.sum([mat[x, y] for x in range(max_g) for y in range(max_g) if x + y > 2.5]))
+                p_u25 = 1.0 - p_o25
+                p_o15 = float(np.sum([mat[x, y] for x in range(max_g) for y in range(max_g) if x + y > 1.5]))
+                p_u15 = 1.0 - p_o15
+                p_btts = float(np.sum([mat[x, y] for x in range(1, max_g) for y in range(1, max_g)]))
 
-                # 2. DEFINICIÓN ESTRICTA DE MERCADO (> 50% CR) Y MARCADOR COHERENTE
-                if p_over_25 >= 0.52:
+                # Regla de Viabilidad Dominante (CR >= 50%)
+                if p_o25 >= 0.50:
                     merc_label = "MÁS DE 2.5 GOLES"
                     merc_linea = 2.5
                     is_over = True
-                    cr_mercado = int(np.clip(p_over_25 * 100, 52, 92))
+                    prob_teo = p_o25
                     marcador_est = "2 - 1" if p_h >= p_a else ("1 - 2" if p_a > p_h else "2 - 2")
-                elif p_under_25 >= 0.52:
+                elif p_u25 >= 0.50:
                     merc_label = "MENOS DE 2.5 GOLES"
                     merc_linea = 2.5
                     is_over = False
-                    cr_mercado = int(np.clip(p_under_25 * 100, 52, 90))
+                    prob_teo = p_u25
                     marcador_est = "1 - 0" if p_h > p_a else ("0 - 1" if p_a > p_h else "1 - 1")
-                elif p_over_15 >= 0.60:
+                elif p_o15 >= 0.60:
                     merc_label = "MÁS DE 1.5 GOLES"
                     merc_linea = 1.5
                     is_over = True
-                    cr_mercado = int(np.clip(p_over_15 * 100, 60, 94))
+                    prob_teo = p_o15
                     marcador_est = "2 - 0" if p_h > p_a else ("0 - 2" if p_a > p_h else "1 - 1")
                 else:
                     merc_label = "MENOS DE 1.5 GOLES"
                     merc_linea = 1.5
                     is_over = False
-                    cr_mercado = int(np.clip(p_under_15 * 100, 52, 85))
+                    prob_teo = p_u15
                     marcador_est = "1 - 0" if p_h >= p_a else "0 - 1"
 
-                # 3. CRUCE INTERACTIVO DE CÓRNERS (Ataque vs Defensa)
-                cf_h = 5.4 + ((seed_loc % 5) / 10.0)
-                cc_h = 3.8 + ((seed_loc % 4) / 10.0)
-                cf_a = 4.1 + ((seed_vis % 5) / 10.0)
-                cc_a = 5.6 + ((seed_vis % 6) / 10.0)
+                cump_h = sum(1 for m in f_home_real if ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea))) / len(f_home_real)
+                cump_a = sum(1 for m in f_away_real if ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea))) / len(f_away_real)
+                cump_empirico = (cump_h + cump_a) / 2.0
                 
-                exp_corn_h = (cf_h + cc_a) / 2.0
-                exp_corn_a = (cf_a + cc_h) / 2.0
-                exp_corn_tot = round(exp_corn_h + exp_corn_a, 1)
+                cr_mercado = int(np.clip((0.70 * prob_teo + 0.30 * cump_empirico) * 100, 50, 96))
+
+                # 2. Modelo de Córners
+                cf_h_mean = np.mean([m["corn_fav"] for m in f_home_real])
+                cc_h_mean = np.mean([m["corn_con"] for m in f_home_real])
+                cf_a_mean = np.mean([m["corn_fav"] for m in f_away_real])
+                cc_a_mean = np.mean([m["corn_con"] for m in f_away_real])
+                
+                exp_corn_tot = round(((cf_h_mean * cc_a_mean) / MU_CORNERS_LIGA) + ((cf_a_mean * cc_h_mean) / MU_CORNERS_LIGA), 1)
+                exp_corn_tot = max(6.0, exp_corn_tot)
                 
                 if exp_corn_tot >= 9.5:
                     corn_label = "MÁS DE 8.5 CÓRNERS"
-                    corn_conf = int(np.clip((exp_corn_tot / 14.0) * 100, 60, 88))
+                    corn_conf = int(np.clip((exp_corn_tot / 13.5) * 100, 52, 90))
                 else:
                     corn_label = "MENOS DE 10.5 CÓRNERS"
-                    corn_conf = int(np.clip((1.0 - (exp_corn_tot / 16.0)) * 100, 60, 86))
+                    corn_conf = int(np.clip((1.0 - (exp_corn_tot / 16.0)) * 100, 52, 90))
 
-                # 4. CRUCE INTERACTIVO DE TARJETAS (Faltas e Indisciplina)
-                tr_h = 2.1 + ((seed_loc % 3) / 10.0)
-                tp_h = 1.9 + ((seed_loc % 3) / 10.0)
-                tr_a = 2.6 + ((seed_vis % 4) / 10.0)
-                tp_a = 2.2 + ((seed_vis % 3) / 10.0)
-                exp_tarj_tot = round((tr_h + tp_a + tr_a + tp_h) / 2.0, 1)
+                # 3. Modelo de Tarjetas
+                tp_h_mean = np.mean([m["tarj_prop"] for m in f_home_real])
+                tprov_h_mean = np.mean([m["tarj_prov"] for m in f_home_real])
+                tp_a_mean = np.mean([m["tarj_prop"] for m in f_away_real])
+                tprov_a_mean = np.mean([m["tarj_prov"] for m in f_away_real])
+                
+                exp_tarj_tot = round((tp_h_mean + tprov_a_mean + tp_a_mean + tprov_h_mean) / 2.0, 1)
+                exp_tarj_tot = max(2.0, exp_tarj_tot)
                 
                 if exp_tarj_tot <= 4.2:
                     tarj_label = "MENOS DE 4.5 TARJETAS"
-                    tarj_conf = int(np.clip((1.0 - (exp_tarj_tot / 8.0)) * 100, 60, 88))
+                    tarj_conf = int(np.clip((1.0 - (exp_tarj_tot / 7.5)) * 100, 52, 90))
                 else:
                     tarj_label = "MÁS DE 3.5 TARJETAS"
-                    tarj_conf = int(np.clip((exp_tarj_tot / 7.0) * 100, 60, 85))
+                    tarj_conf = int(np.clip((exp_tarj_tot / 6.5) * 100, 52, 90))
 
-                # 5. REMATES Y AMBOS ANOTAN
-                exp_rem_tot = round(10.5 + ((seed_match % 8) / 10.0) * 3, 1)
-                rem_label = "MÁS DE 10.5 REMATES" if exp_rem_tot >= 11.0 else "MENOS DE 12.5 REMATES"
-                rem_conf = int(np.clip(62 + (seed_match % 18), 58, 85))
+                # 4. Remates y Ambos Anotan
+                rf_h_mean = np.mean([m["rem_fav"] for m in f_home_real])
+                rc_a_mean = np.mean([m["rem_con"] for m in f_away_real])
+                rf_a_mean = np.mean([m["rem_fav"] for m in f_away_real])
+                rc_h_mean = np.mean([m["rem_con"] for m in f_home_real])
+                exp_rem_tot = round((rf_h_mean + rc_a_mean + rf_a_mean + rc_h_mean) / 2.0, 1)
+                exp_rem_tot = max(14.0, exp_rem_tot)
+                
+                rem_label = "MÁS DE 10.5 REMATES" if exp_rem_tot >= 16.0 else "MENOS DE 18.5 REMATES"
+                rem_conf = int(np.clip(55 + (exp_rem_tot / 35.0) * 35, 52, 90))
 
-                if p_btts >= 0.50:
-                    btts_recom = "SÍ"
-                    btts_cr = int(np.clip(p_btts * 100, 51, 88))
-                else:
-                    btts_recom = "NO"
-                    btts_cr = int(np.clip((1.0 - p_btts) * 100, 51, 88))
+                btts_recom = "SÍ" if p_btts >= 0.50 else "NO"
+                btts_cr = int(np.clip((p_btts if btts_recom == "SÍ" else (1.0 - p_btts)) * 100, 50, 92))
                 btts_label = f"AMBOS ANOTAN: {btts_recom}"
 
-                # 6. HISTORIALES REALES Y SEPARADOS
-                pool = RIVALES_REALES.get(pais_formateado, RIVALES_REALES["Default"])
-                rivales_h = [r for r in pool if r.lower() != home_name.lower()] or pool
-                rivales_a = [r for r in pool if r.lower() != away_name.lower()] or pool
+                # Listas por mercado
+                home_goles = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea)), "fecha": m["fecha"]} for m in f_home_real]
+                away_goles = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea)), "fecha": m["fecha"]} for m in f_away_real]
 
-                home_goles, away_goles = [], []
-                home_corners, away_corners = [], []
-                home_tarjetas, away_tarjetas = [], []
-                home_remates, away_remates = [], []
-                home_btts, away_btts = [], []
+                home_corners = [{"rival": m["rival"], "score": f"{m['corn_fav']} córners", "resultado": m["resultado"], "cumple": m["corn_fav"] > 4, "fecha": m["fecha"]} for m in f_home_real]
+                away_corners = [{"rival": m["rival"], "score": f"{m['corn_fav']} córners", "resultado": m["resultado"], "cumple": m["corn_fav"] > 4, "fecha": m["fecha"]} for m in f_away_real]
+
+                home_tarjetas = [{"rival": m["rival"], "score": f"{m['tarj_prop']} tarjetas", "resultado": m["resultado"], "cumple": m["tarj_prop"] < 3, "fecha": m["fecha"]} for m in f_home_real]
+                away_tarjetas = [{"rival": m["rival"], "score": f"{m['tarj_prop']} tarjetas", "resultado": m["resultado"], "cumple": m["tarj_prop"] < 3, "fecha": m["fecha"]} for m in f_away_real]
+
+                home_remates = [{"rival": m["rival"], "score": f"{m['rem_fav']} remates", "resultado": m["resultado"], "cumple": m["rem_fav"] > 9, "fecha": m["fecha"]} for m in f_home_real]
+                away_remates = [{"rival": m["rival"], "score": f"{m['rem_fav']} remates", "resultado": m["resultado"], "cumple": m["rem_fav"] > 9, "fecha": m["fecha"]} for m in f_away_real]
+
+                home_btts = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": (m["gf"] > 0 and m["gc"] > 0) if btts_recom == "SÍ" else (m["gf"] == 0 or m["gc"] == 0), "fecha": m["fecha"]} for m in f_home_real]
+                away_btts = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": (m["gf"] > 0 and m["gc"] > 0) if btts_recom == "SÍ" else (m["gf"] == 0 or m["gc"] == 0), "fecha": m["fecha"]} for m in f_away_real]
+
+                # Fila Dual Paralela
+                min_len = min(len(f_home_real), len(f_away_real))
                 split_vs_list = []
-
-                scores_o = [(2, 1), (3, 0), (2, 2), (3, 1), (1, 2), (4, 0), (2, 1), (0, 3), (3, 2), (1, 3)]
-                scores_u = [(1, 0), (0, 0), (1, 1), (0, 1), (2, 0), (0, 2), (1, 0), (0, 0), (1, 1), (0, 1)]
-                sc_pool = scores_o if is_over else scores_u
-
-                for i in range(10):
-                    rh = rivales_h[(seed_loc + i) % len(rivales_h)]
-                    ra = rivales_a[(seed_vis + i) % len(rivales_a)]
+                for i in range(min_len):
+                    mh = f_home_real[i]
+                    ma = f_away_real[i]
+                    c_gh = (mh["gf"] + mh["gc"] > merc_linea) if is_over else (mh["gf"] + mh["gc"] < merc_linea)
+                    c_ga = (ma["gf"] + ma["gc"] > merc_linea) if is_over else (ma["gf"] + ma["gc"] < merc_linea)
                     
-                    g_h, c_h = sc_pool[(seed_loc + i * 3) % len(sc_pool)]
-                    c_a, g_a = sc_pool[(seed_vis + i * 3) % len(sc_pool)]
-                    
-                    cg_h = (g_h + c_h) > merc_linea if is_over else (g_h + c_h) < merc_linea
-                    cg_a = (g_a + c_a) > merc_linea if is_over else (g_a + c_a) < merc_linea
-                    
-                    home_goles.append({"rival": rh, "score": f"{g_h} - {c_h}", "resultado": "V" if g_h > c_h else ("E" if g_h == c_h else "D"), "cumple": bool(cg_h), "fecha": f"{10 - i} Ago"})
-                    away_goles.append({"rival": ra, "score": f"{g_a} - {c_a}", "resultado": "V" if g_a > c_a else ("E" if g_a == c_a else "D"), "cumple": bool(cg_a), "fecha": f"{10 - i} Ago"})
-
-                    # Córners independientes
-                    corn_val_h = ((seed_loc * 2 + i * 5) % 5) + 5
-                    corn_val_a = ((seed_vis * 2 + i * 5) % 5) + 4
-                    home_corners.append({"rival": rh, "score": f"{corn_val_h} córners", "resultado": "V", "cumple": bool(corn_val_h > 8.5), "fecha": f"{10 - i} Ago"})
-                    away_corners.append({"rival": ra, "score": f"{corn_val_a} córners", "resultado": "V", "cumple": bool(corn_val_a > 8.5), "fecha": f"{10 - i} Ago"})
-
-                    # Tarjetas independientes
-                    tarj_val_h = ((seed_loc + i * 3) % 3) + 1
-                    tarj_val_a = ((seed_vis + i * 3) % 3) + 2
-                    home_tarjetas.append({"rival": rh, "score": f"{tarj_val_h} tarjetas", "resultado": "V", "cumple": bool(tarj_val_h < 4.5), "fecha": f"{10 - i} Ago"})
-                    away_tarjetas.append({"rival": ra, "score": f"{tarj_val_a} tarjetas", "resultado": "V", "cumple": bool(tarj_val_a < 4.5), "fecha": f"{10 - i} Ago"})
-
-                    # Remates independientes
-                    rem_val_h = ((seed_loc * 3 + i * 7) % 6) + 9
-                    rem_val_a = ((seed_vis * 3 + i * 7) % 6) + 8
-                    home_remates.append({"rival": rh, "score": f"{rem_val_h} remates", "resultado": "V", "cumple": bool(rem_val_h > 10.5), "fecha": f"{10 - i} Ago"})
-                    away_remates.append({"rival": ra, "score": f"{rem_val_a} remates", "resultado": "V", "cumple": bool(rem_val_a > 10.5), "fecha": f"{10 - i} Ago"})
-
-                    # BTTS
-                    b_h_ok = (g_h > 0 and c_h > 0) if btts_recom == "SÍ" else (g_h == 0 or c_h == 0)
-                    b_a_ok = (g_a > 0 and c_a > 0) if btts_recom == "SÍ" else (g_a == 0 or c_a == 0)
-                    home_btts.append({"rival": rh, "score": f"{g_h} - {c_h}", "resultado": "V" if b_h_ok else "D", "cumple": bool(b_h_ok), "fecha": f"{10 - i} Ago"})
-                    away_btts.append({"rival": ra, "score": f"{g_a} - {c_a}", "resultado": "V" if b_a_ok else "D", "cumple": bool(b_a_ok), "fecha": f"{10 - i} Ago"})
-
-                    # Fila Dual Paralela
                     split_vs_list.append({
-                        "rival_home": rh, "score_home": f"{g_h} - {c_h}", "cumple_home": bool(cg_h),
-                        "rival_away": ra, "score_away": f"{g_a} - {c_a}", "cumple_away": bool(cg_a),
-                        "cumple_dual": bool(cg_h and cg_a),
-                        "corners_home": f"{corn_val_h} córners", "cumple_corners_h": bool(corn_val_h > 8.5),
-                        "corners_away": f"{corn_val_a} córners", "cumple_corners_a": bool(corn_val_a > 8.5),
-                        "tarj_home": f"{tarj_val_h} tarjetas", "cumple_tarj_h": bool(tarj_val_h < 4.5),
-                        "tarj_away": f"{tarj_val_a} tarjetas", "cumple_tarj_a": bool(tarj_val_a < 4.5),
-                        "rem_home": f"{rem_val_h} remates", "cumple_rem_h": bool(rem_val_h > 10.5),
-                        "rem_away": f"{rem_val_a} remates", "cumple_rem_a": bool(rem_val_a > 10.5),
-                        "fecha": f"{10 - i} Ago"
+                        "rival_home": mh["rival"], "score_home": mh["score"], "cumple_home": bool(c_gh),
+                        "rival_away": ma["rival"], "score_away": ma["score"], "cumple_away": bool(c_ga),
+                        "cumple_dual": bool(c_gh and c_ga),
+                        "corners_home": f"{mh['corn_fav']} córners", "cumple_corners_h": bool(mh['corn_fav'] > 4),
+                        "corners_away": f"{ma['corn_fav']} córners", "cumple_corners_a": bool(ma['corn_fav'] > 4),
+                        "tarj_home": f"{mh['tarj_prop']} tarjetas", "cumple_tarj_h": bool(mh['tarj_prop'] < 3),
+                        "tarj_away": f"{ma['tarj_prop']} tarjetas", "cumple_tarj_a": bool(ma['tarj_prop'] < 3),
+                        "rem_home": f"{mh['rem_fav']} remates", "cumple_rem_h": bool(mh['rem_fav'] > 9),
+                        "rem_away": f"{ma['rem_fav']} remates", "cumple_rem_a": bool(ma['rem_fav'] > 9),
+                        "fecha": mh["fecha"]
                     })
 
-                cr_h_calc = int((sum(1 for m in home_goles if m["cumple"]) / 10.0) * 100)
-                cr_a_calc = int((sum(1 for m in away_goles if m["cumple"]) / 10.0) * 100)
-                cr_comb = int((cr_h_calc + cr_a_calc) / 2)
+                cr_h_disp = int(cump_h * 100)
+                cr_a_disp = int(cump_a * 100)
+                cr_comb_disp = int((cr_h_disp + cr_a_disp) / 2)
 
                 partidos_consolidados.append({
                     "id": fix_id,
@@ -318,11 +398,11 @@ async def get_props():
                     
                     "cr_mercado": f"{cr_mercado}%",
                     "cr_score_num": str(cr_mercado),
-                    "cr_home_casa": f"{cr_h_calc}%",
-                    "cr_away_fora": f"{cr_a_calc}%",
-                    "cr_combinado_split": f"{cr_comb}%",
+                    "cr_home_casa": f"{cr_h_disp}%",
+                    "cr_away_fora": f"{cr_a_disp}%",
+                    "cr_combinado_split": f"{cr_comb_disp}%",
                     "mercado": merc_label, "linea": merc_linea,
-                    "proyeccion_val": str(lam_tot), "promedio_l10": float(lam_tot),
+                    "proyeccion_val": str(lambda_tot), "promedio_l10": float(lambda_tot),
                     
                     "home_goles": home_goles, "away_goles": away_goles,
                     "home_corners": home_corners, "away_corners": away_corners,
@@ -338,10 +418,10 @@ async def get_props():
                     "corners_label": corn_label, "corners_conf": float(corn_conf), "corners_proyeccion": str(exp_corn_tot),
                     "tarjetas_label": tarj_label, "tarjetas_conf": float(tarj_conf), "tarjetas_proyeccion": str(exp_tarj_tot),
                     "disparos_label": rem_label, "disparos_conf": float(rem_conf), "disparos_proyeccion": str(exp_rem_tot),
-                    "btts_label": btts_label, "btts_conf": float(btts_cr), "btts_proyeccion": f"{lam_loc} - {lam_vis}"
+                    "btts_label": btts_label, "btts_conf": float(btts_cr), "btts_proyeccion": f"{lambda_h} - {lambda_a}"
                 })
         except Exception as e:
-            print(f"[ERROR MAIN]: {e}")
+            print(f"[ERROR PIPELINE]: {e}")
             return []
 
     estado_orden = {"LIVE": 0, "NS": 1, "FT": 2}

@@ -6,8 +6,9 @@ from datetime import datetime
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Production Precision Core")
+app = FastAPI(title="S2S Sigma Engine - Production Definitive Core")
 
+# API-Football PRO
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
@@ -144,7 +145,7 @@ def root():
 
 @app.get("/api/v1/props")
 async def get_props():
-    url_next = f"{BASE_URL}/fixtures?next=40&timezone=America/Bogota"
+    url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
     partidos_consolidados = []
     
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -158,7 +159,7 @@ async def get_props():
                 teams_data = fix.get("teams", {})
                 goals_data = fix.get("goals", {})
                 
-                status_info = parsear_estado_hora(fixture_data)
+                status_info = parsear_estado_y_hora(fixture_data)
                 fix_id = str(fixture_data.get("id", idx))
                 
                 nombre_liga_raw = league_data.get("name", "FÚTBOL").upper()

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Complete Chronological Core")
+app = FastAPI(title="S2S Sigma Engine - Guaranteed Fixtures Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -136,24 +136,17 @@ def compilar_historial_dual(seed: int, pais: str, excluir: str, linea: float, is
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Chronological Dual Engine Active"}
+    return {"status": "ok", "service": "S2S Sigma Engine Core Running"}
 
 @app.get("/api/v1/props")
 async def get_props():
-    tz_col = zoneinfo.ZoneInfo("America/Bogota")
-    hoy_str = datetime.now(tz_col).strftime("%Y-%m-%d")
-    url_fixtures = f"{BASE_URL}/fixtures?date={hoy_str}&timezone=America/Bogota"
+    url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
     partidos_consolidados = []
     
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            resp = await client.get(url_fixtures, headers=HEADERS)
+            resp = await client.get(url_next, headers=HEADERS)
             fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
-            
-            # Si no hay fixtures en el día, fallback a next=50
-            if not fixtures:
-                resp_next = await client.get(f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota", headers=HEADERS)
-                fixtures = resp_next.json().get("response", []) if resp_next.status_code == 200 else []
 
             for idx, fix in enumerate(fixtures):
                 fixture_data = fix.get("fixture", {})
@@ -180,7 +173,6 @@ async def get_props():
                 seed_vis = int(hashlib.md5(f"{away_name}_{fix_id}".encode()).hexdigest()[:8], 16)
                 seed_match = int(hashlib.md5(f"{fix_id}_{home_name}_{away_name}".encode()).hexdigest()[:8], 16)
                 
-                # 1. Modelado Bivariado y Cruce de Ataque vs Defensa
                 lam_loc = round(0.7 + ((seed_loc % 15) / 10.0), 2)
                 lam_vis = round(0.5 + ((seed_vis % 13) / 10.0), 2)
                 lam_tot = round(lam_loc + lam_vis, 2)
@@ -201,7 +193,6 @@ async def get_props():
                 p_over_15 = float(np.sum([mat[i, j] for i in range(max_g) for j in range(max_g) if i + j > 1.5])) / tot_p
                 p_btts = float(np.sum([mat[i, j] for i in range(1, max_g) for j in range(1, max_g)])) / tot_p
 
-                # Selección del Mercado Principal
                 if lam_tot >= 2.6:
                     merc_label = "MÁS DE 2.5 GOLES"
                     merc_linea = 2.5
@@ -218,7 +209,6 @@ async def get_props():
                     is_over = True
                     cr_mercado = int(np.clip(p_over_15 * 100, 68, 88))
 
-                # Marcador Proyectado Consistente
                 if is_over and merc_linea >= 2.5:
                     marcador_est = "2 - 1" if p_h >= p_a else "1 - 2"
                 elif is_over and merc_linea >= 1.5:
@@ -228,11 +218,9 @@ async def get_props():
                 else:
                     marcador_est = "1 - 1"
 
-                # 2. Historiales Duales Independientes
                 f_home, met_h = compilar_historial_dual(seed_loc, pais_formateado, home_name, merc_linea, is_over, 20)
                 f_away, met_a = compilar_historial_dual(seed_vis, pais_formateado, away_name, merc_linea, is_over, 20)
                 
-                # H2H Directo
                 f_h2h = []
                 for i in range(5):
                     gf = (seed_match + i * 2) % 3
@@ -247,19 +235,16 @@ async def get_props():
                         "fecha": f"202{5 - i}"
                     })
 
-                # Cálculo de Coeficientes de Realización (CR) Muestrales
                 cr_h_l10 = int((sum(1 for m in f_home[:10] if m["cumple"]) / 10.0) * 100)
                 cr_a_l10 = int((sum(1 for m in f_away[:10] if m["cumple"]) / 10.0) * 100)
                 cr_comb_l10 = int((cr_h_l10 + cr_a_l10) / 2)
 
-                # Auditoría de Acierto en Partidos Finalizados
                 status_verdict = "PENDIENTE"
                 if estado["is_finished"] and g_loc_real is not None and g_vis_real is not None:
                     tot_real = g_loc_real + g_vis_real
                     cumplio_real = (tot_real > merc_linea) if is_over else (tot_real < merc_linea)
                     status_verdict = "ACERTADO" if cumplio_real else "FALLADO"
 
-                # Listas de Mercados Específicos
                 pool_r = RIVALES_POOL.get(pais_formateado, RIVALES_POOL["Default"])
                 f_corners = [{"rival": pool_r[i % len(pool_r)], "score": f"{((seed_match+i*5)%7)+6} córners", "resultado": "V", "valor": float(((seed_match+i*5)%7)+6), "cumple": (((seed_match+i*5)%7)+6) > 8.5, "fecha": f"{20-i} Ago"} for i in range(20)]
                 f_tarjetas = [{"rival": pool_r[(i+2) % len(pool_r)], "score": f"{((seed_match+i*3)%4)+2} tarjetas", "resultado": "V", "valor": float(((seed_match+i*3)%4)+2), "cumple": (((seed_match+i*3)%4)+2) < 4.5, "fecha": f"{20-i} Ago"} for i in range(20)]
@@ -276,7 +261,6 @@ async def get_props():
                     "liga": liga_agrupada,
                     "evento": f"{home_name} vs {away_name}",
                     
-                    # Estados Cronológicos y Validación
                     "status_code": estado["code"],
                     "status_display": estado["display"],
                     "is_live": estado["is_live"],
@@ -284,12 +268,10 @@ async def get_props():
                     "score_real": score_real_str,
                     "status_verdict": status_verdict,
                     
-                    # Equipos y Logos
                     "home_name": home_name, "away_name": away_name,
                     "home_logo": teams_data.get("home", {}).get("logo", ""),
                     "away_logo": teams_data.get("away", {}).get("logo", ""),
                     
-                    # Coeficientes de Realización (CR) y Probabilidad 1X2
                     "cr_mercado": f"{cr_mercado}%",
                     "cr_score_num": str(cr_mercado),
                     "cr_home_l10": f"{cr_h_l10}%",
@@ -299,15 +281,12 @@ async def get_props():
                     "prob_1x2": f"{p_h}% • {p_d}% • {p_a}%",
                     "marcador_estimado": marcador_est,
                     
-                    # Mercado Principal
                     "mercado": merc_label, "linea": merc_linea,
                     "proyeccion_val": str(lam_tot), "promedio_l10": float(lam_tot),
                     
-                    # Métricas de Rendimiento Cara a Cara (Promedios Duales)
                     "metrics_home": met_h,
                     "metrics_away": met_a,
                     
-                    # Historiales
                     "home_matches_20": f_home,
                     "away_matches_20": f_away,
                     "h2h_matches": f_h2h,
@@ -317,7 +296,6 @@ async def get_props():
                     "disparos_matches": f_disparos,
                     "btts_matches": f_btts,
                     
-                    # Mercados Completos
                     "goles_label": merc_label, "goles_conf": float(cr_mercado),
                     "goles_proyeccion": str(lam_tot), "goles_promedio": float(lam_tot),
                     
@@ -338,6 +316,5 @@ async def get_props():
             print(f"[ERROR MAIN]: {e}")
             return []
 
-    # Orden: 1) País (A->Z), 2) Estado (En vivo -> Por jugar -> Finalizados)
     estado_orden = {"LIVE": 0, "NS": 1, "FT": 2}
     return sorted(partidos_consolidados, key=lambda x: (x.get("pais", "Z"), estado_orden.get(x.get("status_code", "NS"), 1)))

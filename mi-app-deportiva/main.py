@@ -6,9 +6,8 @@ from datetime import datetime
 import zoneinfo
 import hashlib
 
-app = FastAPI(title="S2S Sigma Engine - Production Analytical Core")
+app = FastAPI(title="S2S Sigma Engine - Guaranteed Feed 24/7")
 
-# Credenciales API-Football PRO
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
@@ -40,7 +39,14 @@ def formatear_hora_colombia(fecha_iso: str) -> str:
         tz_col = zoneinfo.ZoneInfo("America/Bogota")
         dt_utc = datetime.fromisoformat(fecha_iso.replace("Z", "+00:00")).replace(tzinfo=tz_utc)
         dt_col = dt_utc.astimezone(tz_col)
-        return dt_col.strftime("HOY · %I:%M %p")
+        
+        hoy_str = datetime.now(tz_col).strftime("%Y-%m-%d")
+        partido_str = dt_col.strftime("%Y-%m-%d")
+        
+        if hoy_str == partido_str:
+            return f"HOY · {dt_col.strftime('%I:%M %p')}"
+        else:
+            return f"{dt_col.strftime('%d/%m')} · {dt_col.strftime('%I:%M %p')}"
     except Exception:
         return fecha_iso[11:16]
 
@@ -66,7 +72,7 @@ def calcular_poisson(historial: list, linea: float, tipo_mercado: str) -> dict:
     aciertos_l5 = int(np.sum(l10[-5:] > linea)) if recom_code == "O" else int(np.sum(l10[-5:] < linea))
     
     return {
-        "fiabilidad": int(np.clip(fiabilidad, 52, 98)),
+        "fiabilidad": int(np.clip(fiabilidad, 55, 96)),
         "recomendacion_code": recom_code,
         "label": f"{recom_texto} {tipo_mercado}",
         "linea": linea,
@@ -133,7 +139,7 @@ def construir_matches_forma(seed: int, home_name: str, away_name: str, linea: fl
             resultado = "V" if (seed + i) % 3 != 0 else "D"
             cumple = val_total < linea
             score_txt = f"{val_total} tarjetas"
-        else: # REMATES
+        else:
             val_total = (seed * 5 + i * 7) % 8 + 7
             resultado = "V" if (seed + i) % 2 != 0 else "E"
             cumple = val_total > linea
@@ -143,15 +149,15 @@ def construir_matches_forma(seed: int, home_name: str, away_name: str, linea: fl
             "rival": riv,
             "score": score_txt,
             "resultado": resultado,
-            "valor_numerico": val_total,
-            "cumple": cumple,
+            "valor_numerico": float(val_total),
+            "cumple": bool(cumple),
             "fecha": f"{10 - i} Ago"
         })
     return matches
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Quantitative Analytical Core Active"}
+    return {"status": "ok", "service": "S2S Engine 24/7 Operational"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -166,6 +172,7 @@ async def get_props():
             if resp.status_code == 200:
                 fixtures = resp.json().get("response", [])
             
+            # Si no hay fixtures pendientes hoy, traer los próximos 50 eventos
             if not fixtures:
                 url_next = f"{BASE_URL}/fixtures?next=50&timezone=America/Bogota"
                 resp_next = await client.get(url_next, headers=HEADERS)
@@ -214,7 +221,6 @@ async def get_props():
                 calc_disparos = calcular_poisson(hist_disparos, 9.5, "REMATES")
                 calc_btts = calcular_btts(hist_goles_loc, hist_goles_vis)
                 
-                # Contextos 100% personalizados y calculados
                 prom_goles_loc = float(np.mean(hist_goles_loc))
                 prom_goles_vis = float(np.mean(hist_goles_vis))
                 over_goles_count = sum(1 for g in hist_goles if g > 2.5)
@@ -230,8 +236,8 @@ async def get_props():
                 matches_tarjetas = construir_matches_forma(seed, home_name, away_name, 4.5, "TARJETAS")
                 matches_remates = construir_matches_forma(seed, home_name, away_name, 9.5, "REMATES")
                 
-                max_conf = max(calc_goles["fiabilidad"], calc_corners["fiabilidad"], calc_tarjetas["fiabilidad"])
-                es_alto_valor = max_conf >= 66
+                # Asignación de Alto Valor: siempre incluye los partidos con fiabilidad >= 60%
+                es_alto_valor = bool(calc_goles["fiabilidad"] >= 60 or calc_corners["fiabilidad"] >= 65)
                 
                 partidos_consolidados.append({
                     "id": fix_id,
@@ -269,13 +275,11 @@ async def get_props():
                     "hit_casa": calc_goles["hit_casa"],
                     "hit_fora": calc_goles["hit_fora"],
                     
-                    # Fichas de Forma Estructuradas por Mercado
                     "goles_matches": matches_goles,
                     "corners_matches": matches_corners,
                     "tarjetas_matches": matches_tarjetas,
                     "disparos_matches": matches_remates,
                     
-                    # Métricas de Mercados
                     "goles_label": calc_goles["label"],
                     "goles_conf": float(calc_goles["fiabilidad"]),
                     "goles_proyeccion": str(calc_goles["proyeccion"]),

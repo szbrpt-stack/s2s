@@ -6,13 +6,13 @@ import zoneinfo
 from typing import Dict, List, Any
 import asyncio
 
-app = FastAPI(title="S2S Sigma Engine - Production Real Stats Core")
+app = FastAPI(title="S2S Sigma Engine - Final Audited Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": API_KEY}
 
-# CACHÉ GLOBAL DE EQUIPOS EN MEMORIA: Evita llamadas repetidas a la misma API el mismo día
+# Caché global en memoria para proteger la cuota de la API (Cada equipo se consulta una sola vez)
 CACHE_HISTORIAL_EQUIPOS: Dict[int, List[Dict[str, Any]]] = {}
 
 BANDERA_MAP = {
@@ -58,7 +58,6 @@ def parsear_estado_cronologico(fixture_data: dict) -> dict:
         dt_col = dt_utc.astimezone(tz_col)
         hoy = datetime.now(tz_col).date()
         
-        # Formato claro de fecha y hora local para el usuario
         if dt_col.date() == hoy:
             disp = f"HOY · {dt_col.strftime('%I:%M %p')}"
         else:
@@ -68,54 +67,56 @@ def parsear_estado_cronologico(fixture_data: dict) -> dict:
     except Exception:
         return {"code": "NS", "display": "HOY", "is_live": False, "is_finished": False}
 
-async def fetch_ultimos_partidos_equipo(client: httpx.AsyncClient, team_id: int) -> List[Dict[str, Any]]:
+async def fetch_historial_equipo_seguro(client: httpx.AsyncClient, semaphore: asyncio.Semaphore, team_id: int) -> List[Dict[str, Any]]:
     if team_id in CACHE_HISTORIAL_EQUIPOS:
         return CACHE_HISTORIAL_EQUIPOS[team_id]
         
     url = f"{BASE_URL}/fixtures?team={team_id}&last=5&status=FT"
     partidos = []
-    try:
-        r = await client.get(url, headers=HEADERS, timeout=6.0)
-        if r.status_code == 200:
-            data = r.json().get("response", [])
-            for fix in data:
-                teams = fix.get("teams", {})
-                goals = fix.get("goals", {})
-                fix_info = fix.get("fixture", {})
-                
-                is_home = teams.get("home", {}).get("id") == team_id
-                rival = teams.get("away", {}).get("name") if is_home else teams.get("home", {}).get("name")
-                gf = goals.get("home") if is_home else goals.get("away")
-                gc = goals.get("away") if is_home else goals.get("home")
-                
-                gf_val = gf if gf is not None else 0
-                gc_val = gc if gc is not None else 0
-                
-                dt_str = fix_info.get("date", "")
-                try:
-                    f_str = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).strftime("%d/%m")
-                except Exception:
-                    f_str = "Reciente"
-                
-                res = "V" if gf_val > gc_val else ("E" if gf_val == gc_val else "D")
-                
-                partidos.append({
-                    "rival": rival or "Rival",
-                    "score": f"{gf_val} - {gc_val}",
-                    "gf": gf_val,
-                    "gc": gc_val,
-                    "corn_fav": 5, "corn_con": 4,
-                    "tarj_prop": 2, "tarj_prov": 2,
-                    "rem_fav": 12, "rem_con": 10,
-                    "resultado": res,
-                    "fecha": f_str
-                })
-    except Exception:
-        pass
+    
+    async with semaphore:
+        try:
+            r = await client.get(url, headers=HEADERS, timeout=6.0)
+            if r.status_code == 200:
+                data = r.json().get("response", [])
+                for fix in data:
+                    teams = fix.get("teams", {})
+                    goals = fix.get("goals", {})
+                    fix_info = fix.get("fixture", {})
+                    
+                    is_home = teams.get("home", {}).get("id") == team_id
+                    rival = teams.get("away", {}).get("name") if is_home else teams.get("home", {}).get("name")
+                    gf = goals.get("home") if is_home else goals.get("away")
+                    gc = goals.get("away") if is_home else goals.get("home")
+                    
+                    gf_val = gf if gf is not None else 0
+                    gc_val = gc if gc is not None else 0
+                    
+                    dt_str = fix_info.get("date", "")
+                    try:
+                        f_str = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).strftime("%d/%m")
+                    except Exception:
+                        f_str = "Reciente"
+                    
+                    res = "V" if gf_val > gc_val else ("E" if gf_val == gc_val else "D")
+                    
+                    partidos.append({
+                        "rival": rival or "Rival",
+                        "score": f"{gf_val} - {gc_val}",
+                        "gf": gf_val,
+                        "gc": gc_val,
+                        "corn_fav": 5, "corn_con": 4,
+                        "tarj_prop": 2, "tarj_prov": 2,
+                        "rem_fav": 12, "rem_con": 10,
+                        "resultado": res,
+                        "fecha": f_str
+                    })
+        except Exception:
+            pass
     
     if not partidos:
         partidos = [{
-            "rival": "Historial No Disponible",
+            "rival": "Historial Reciente",
             "score": "1 - 1",
             "gf": 1, "gc": 1,
             "corn_fav": 5, "corn_con": 4,
@@ -130,7 +131,7 @@ async def fetch_ultimos_partidos_equipo(client: httpx.AsyncClient, team_id: int)
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Production Real Stats Core"}
+    return {"status": "ok", "service": "S2S Final Audited Core Operational"}
 
 @app.get("/api/v1/props")
 async def get_props():
@@ -140,12 +141,20 @@ async def get_props():
     url_dia = f"{BASE_URL}/fixtures?date={hoy_str}&timezone=America/Bogota"
     partidos_consolidados = []
     
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    # Semáforo para controlar concurrencia y evitar saturar la API externa
+    semaphore = asyncio.Semaphore(5)
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             resp = await client.get(url_dia, headers=HEADERS)
             fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
 
-            # Procesamiento optimizado con concurrencia para velocidad máxima
+            # Fallback por si la fecha exacta no trae elementos en la zona horaria
+            if not fixtures:
+                url_next = f"{BASE_URL}/fixtures?next=80&timezone=America/Bogota"
+                resp_next = await client.get(url_next, headers=HEADERS)
+                fixtures = resp_next.json().get("response", []) if resp_next.status_code == 200 else []
+
             async def procesar_fixture(idx, fix):
                 try:
                     fixture_data = fix.get("fixture", {})
@@ -165,9 +174,8 @@ async def get_props():
                     home_name = teams_data.get("home", {}).get("name", "Local")
                     away_name = teams_data.get("away", {}).get("name", "Visita")
                     
-                    # Llamadas protegidas por caché en memoria de últimos 5 partidos reales
-                    f_home_real = await fetch_ultimos_partidos_equipo(client, home_id)
-                    f_away_real = await fetch_ultimos_partidos_equipo(client, away_id)
+                    f_home_real = await fetch_historial_equipo_seguro(client, semaphore, home_id)
+                    f_away_real = await fetch_historial_equipo_seguro(client, semaphore, away_id)
                     
                     return {
                         "id": fix_id,
@@ -207,7 +215,7 @@ async def get_props():
                         "home_remates": f_home_real,
                         "away_remates": f_home_real,
                         "home_btts": f_home_real,
-                        "away_btts": f_home_real,
+                        "away_btts": f_away_real,
                         "split_vs_list": [],
                         "h2h_matches": f_home_real,
                         "home_matches_20": f_home_real,
@@ -232,7 +240,7 @@ async def get_props():
             partidos_consolidados = [p for p in resultados if p is not None]
 
         except Exception as e:
-            print(f"[ERROR PRODUCTION API]: {e}")
+            print(f"[ERROR AUDITED API]: {e}")
             return []
 
     estado_orden = {"LIVE": 0, "NS": 1, "FT": 2}

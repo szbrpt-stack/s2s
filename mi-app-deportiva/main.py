@@ -7,7 +7,7 @@ import zoneinfo
 from typing import Dict, List, Any
 import asyncio
 
-app = FastAPI(title="S2S Sigma Engine - Fully Audited Production Core")
+app = FastAPI(title="S2S Sigma Engine - Strict Audited Production Core")
 
 API_KEY = "9cf313ae66d39a8f1aa2674401de70ce"
 BASE_URL = "https://v3.football.api-sports.io"
@@ -20,7 +20,7 @@ MU_GOLES_VISITA = 1.15
 MU_CORNERS_LIGA = 9.80
 MU_TARJETAS_LIGA = 4.30
 
-# Caché en memoria para optimizar el rendimiento y proteger la cuota de la API
+# Caché global en memoria para optimizar el rendimiento y proteger el consumo
 CACHE_HISTORIAL_EQUIPOS: Dict[int, List[Dict[str, Any]]] = {}
 
 BANDERA_MAP = {
@@ -73,7 +73,7 @@ def parsear_estado_cronologico(fixture_data: dict) -> dict:
             
         return {"code": "NS", "display": disp, "is_live": False, "is_finished": False, "sort_order": 1, "datetime": dt_col}
     except Exception:
-        return {"code": "NS", "display": "HOY", "is_live": False, "is_finished": False, "sort_order": 1}
+        return {"code": "NS", "display": "HOY", "is_live": False, "is_finished": False, "sort_order": 1, "datetime": datetime.min}
 
 def tau_dixon_coles(x: int, y: int, lambda_h: float, lambda_a: float, rho: float = RHO_DIXON_COLES) -> float:
     if x == 0 and y == 0:
@@ -120,7 +120,7 @@ async def fetch_historial_real_equipo(client: httpx.AsyncClient, semaphore: asyn
                     res = "V" if gf_val > gc_val else ("E" if gf_val == gc_val else "D")
                     
                     partidos.append({
-                        "rival": rival or "Rival",
+                        "rival": rival or "Rival Oficial",
                         "score": f"{gf_val} - {gc_val}",
                         "gf": gf_val,
                         "gc": gc_val,
@@ -150,27 +150,31 @@ async def fetch_historial_real_equipo(client: httpx.AsyncClient, semaphore: asyn
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "S2S Fully Audited Mathematical Core"}
+    return {"status": "ok", "service": "S2S Strict Audited Production Core"}
 
 @app.get("/api/v1/props")
 async def get_props():
     tz_col = zoneinfo.ZoneInfo("America/Bogota")
     hoy_str = datetime.now(tz_col).strftime("%Y-%m-%d")
     
+    # 1. LLAMADA PRINCIPAL: Fecha exacta del día
     url_dia = f"{BASE_URL}/fixtures?date={hoy_str}&timezone=America/Bogota"
-    partidos_consolidados = []
     
-    semaphore = asyncio.Semaphore(5)
+    fixtures = []
+    semaphore = asyncio.Semaphore(10) # Aprovechando los 450 RPM permitidos
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             resp = await client.get(url_dia, headers=HEADERS)
-            fixtures = resp.json().get("response", []) if resp.status_code == 200 else []
+            if resp.status_code == 200:
+                fixtures = resp.json().get("response", [])
 
+            # 2. RESPALDO DUAL OBLIGATORIO: Si la fecha exacta viene vacía por desfase horario o zona, traemos los próximos 100 partidos activos
             if not fixtures:
-                url_next = f"{BASE_URL}/fixtures?next=80&timezone=America/Bogota"
+                url_next = f"{BASE_URL}/fixtures?next=100&timezone=America/Bogota"
                 resp_next = await client.get(url_next, headers=HEADERS)
-                fixtures = resp_next.json().get("response", []) if resp_next.status_code == 200 else []
+                if resp_next.status_code == 200:
+                    fixtures = resp_next.json().get("response", [])
 
             async def procesar_fixture(idx, fix):
                 try:
@@ -194,7 +198,7 @@ async def get_props():
                     f_home_real = await fetch_historial_real_equipo(client, semaphore, home_id)
                     f_away_real = await fetch_historial_real_equipo(client, semaphore, away_id)
                     
-                    # CÁLCULOS MATEMÁTICOS REALES (Poisson / Dixon-Coles)
+                    # Motor matemático real Poisson / Dixon-Coles
                     gf_h_mean = np.mean([m["gf"] for m in f_home_real])
                     gc_h_mean = np.mean([m["gc"] for m in f_home_real])
                     gf_a_mean = np.mean([m["gf"] for m in f_away_real])
@@ -253,7 +257,7 @@ async def get_props():
                     cr_mercado = int(np.clip((0.70 * prob_teo + 0.30 * cump_empirico) * 100, 50, 96))
 
                     home_goles = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea)), "fecha": m["fecha"]} for m in f_home_real]
-                    away_goles = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": ((m["gf"] + m["gc"] > merc_linea) if is_over else ((m["gf"] + m["gc"] < merc_linea))), "fecha": m["fecha"]} for m in f_away_real]
+                    away_goles = [{"rival": m["rival"], "score": m["score"], "resultado": m["resultado"], "cumple": ((m["gf"] + m["gc"] > merc_linea) if is_over else (m["gf"] + m["gc"] < merc_linea)), "fecha": m["fecha"]} for m in f_away_real]
 
                     return {
                         "id": fix_id,
@@ -320,10 +324,10 @@ async def get_props():
             partidos_consolidados = [p for p in resultados if p is not None]
 
         except Exception as e:
-            print(f"[ERROR AUDITED PRODUCTION CORE]: {e}")
+            print(f"[ERROR STRICT PRODUCTION CORE]: {e}")
             return []
 
-    # ORDENAMIENTO CRONOLÓGICO ESTRICTO: En Vivo primero, luego por Hora/Fecha real, Finalizados al final
+    # ORDENAMIENTO CRONOLÓGICO ESTRICTO: En Vivo primero, luego por Hora real, Finalizados al final
     return sorted(
         partidos_consolidados, 
         key=lambda x: (

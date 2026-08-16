@@ -389,7 +389,10 @@ async def team_profile(
     async with _key_locks[key]:
         if (hit := cache_get(key)) is not None:
             return hit
-        fixtures_task = provider_get(client, "/fixtures", {"team": team_id, "last": HISTORY_SIZE, "status": "FT"})
+        # API-Football rechaza actualmente la combinación `last` + `status`.
+        # Solicitamos una ventana mayor y conservamos localmente solo finalizados
+        # anteriores al kickoff, hasta completar HISTORY_SIZE observaciones.
+        fixtures_task = provider_get(client, "/fixtures", {"team": team_id, "last": min(HISTORY_SIZE * 2, 40)})
         stats_task = provider_get(
             client,
             "/teams/statistics",
@@ -397,7 +400,12 @@ async def team_profile(
         )
         fixtures, season_stats = await asyncio.gather(fixtures_task, stats_task)
         season_stats = season_stats if isinstance(season_stats, dict) else {}
-        matches = [parsed for row in fixtures if (parsed := parse_match(row, team_id))]
+        matches = [
+            parsed
+            for row in fixtures
+            if fixture_state((row.get("fixture") or {}))["group"] == "FINISHED"
+            and (parsed := parse_match(row, team_id))
+        ]
         matches = sorted((m for m in matches if m["timestamp"] < cutoff.timestamp()), key=lambda m: m["timestamp"], reverse=True)
         played_block = (season_stats.get("fixtures") or {}).get("played") or {}
         result = {
@@ -427,17 +435,17 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
         rows = await provider_get(
             client,
             "/fixtures",
-            {"league": league_id, "season": season, "status": "FT", "last": 100},
+            {"league": league_id, "season": season, "status": "FT"},
         )
-        # API-Football documenta filtros mutuamente excluyentes en /fixtures. Pedimos
-        # los últimos 100 finalizados y aplicamos el corte temporal localmente para
-        # impedir fuga de información del propio día sin combinar `last` con `to`.
+        # No combinamos `last` con `status`; API-Football los considera
+        # incompatibles. El corte local impide fuga de información del propio día.
         eligible = []
         for row in rows if isinstance(rows, list) else []:
             played = parse_dt((row.get("fixture") or {}).get("date")) if isinstance(row, dict) else None
             if played and played < cutoff:
                 eligible.append(row)
-        scores = [row.get("goals") or {} for row in eligible]
+        eligible.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True)
+        scores = [row.get("goals") or {} for row in eligible[:100]]
         valid = [(as_float(s.get("home")), as_float(s.get("away"))) for s in scores]
         valid = [(h, a) for h, a in valid if h is not None and a is not None]
         result = {

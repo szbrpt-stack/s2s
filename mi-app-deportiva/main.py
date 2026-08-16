@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import time
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
@@ -25,8 +26,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
-MAX_FIXTURES = max(1, min(int(os.getenv("MAX_FIXTURES", "6")), 20))
 HTTP_CONCURRENCY = max(2, min(int(os.getenv("HTTP_CONCURRENCY", "8")), 16))
+ANALYSIS_WORKERS = max(1, min(int(os.getenv("ANALYSIS_WORKERS", "4")), 8))
+REQUESTS_PER_MINUTE = max(30, min(int(os.getenv("REQUESTS_PER_MINUTE", "240")), 420))
 RESPONSE_TTL = int(os.getenv("RESPONSE_TTL_SECONDS", "900"))
 TEAM_TTL = int(os.getenv("TEAM_TTL_SECONDS", "21600"))
 FIXTURE_STATS_TTL = int(os.getenv("FIXTURE_STATS_TTL_SECONDS", "86400"))
@@ -36,6 +38,35 @@ EPSILON = 1e-9
 _request_slots = asyncio.Semaphore(HTTP_CONCURRENCY)
 _refresh_lock = asyncio.Lock()
 _cache: dict[str, tuple[float, Any]] = {}
+_key_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_catalog: list[dict[str, Any]] = []
+_analyses: dict[str, dict[str, Any]] = {}
+_analysis_errors: dict[str, str] = {}
+_analysis_task: asyncio.Task[None] | None = None
+_sync_started_at: str | None = None
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self, limit: int, period_seconds: float = 60.0) -> None:
+        self.limit = limit
+        self.period = period_seconds
+        self.timestamps: deque[float] = deque()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                while self.timestamps and now - self.timestamps[0] >= self.period:
+                    self.timestamps.popleft()
+                if len(self.timestamps) < self.limit:
+                    self.timestamps.append(now)
+                    return
+                wait = self.period - (now - self.timestamps[0]) + 0.05
+            await asyncio.sleep(max(wait, 0.05))
+
+
+_provider_limiter = SlidingWindowRateLimiter(REQUESTS_PER_MINUTE)
 
 BANDERAS = {
     "ARGENTINA": ("🇦🇷", "Argentina"), "BRAZIL": ("🇧🇷", "Brasil"),
@@ -66,6 +97,7 @@ async def api_get(client: httpx.AsyncClient, path: str, params: dict[str, Any]) 
     last_error: Exception | None = None
     for attempt in range(3):
         try:
+            await _provider_limiter.acquire()
             async with _request_slots:
                 response = await client.get(path, params=params)
             response.raise_for_status()
@@ -130,9 +162,12 @@ async def fixture_statistics(client: httpx.AsyncClient, fixture_id: int) -> dict
     key = f"fixture-stats:{fixture_id}"
     if (hit := cached(key)) is not None:
         return hit
-    response = await api_get(client, "/fixtures/statistics", {"fixture": fixture_id})
-    result = {int(row.get("team", {}).get("id", 0)): stat_map(row) for row in response if row.get("team", {}).get("id")}
-    return cache_put(key, result, FIXTURE_STATS_TTL)
+    async with _key_locks[key]:
+        if (hit := cached(key)) is not None:
+            return hit
+        response = await api_get(client, "/fixtures/statistics", {"fixture": fixture_id})
+        result = {int(row.get("team", {}).get("id", 0)): stat_map(row) for row in response if row.get("team", {}).get("id")}
+        return cache_put(key, result, FIXTURE_STATS_TTL)
 
 
 async def team_data(client: httpx.AsyncClient, team_id: int, league_id: int, season: int) -> dict[str, Any]:
@@ -140,51 +175,53 @@ async def team_data(client: httpx.AsyncClient, team_id: int, league_id: int, sea
     if (hit := cached(key)) is not None:
         return hit
 
-    fixtures_task = api_get(client, "/fixtures", {"team": team_id, "last": 5, "status": "FT"})
-    season_task = api_get(client, "/teams/statistics", {"team": team_id, "league": league_id, "season": season})
-    fixtures, season_stats = await asyncio.gather(fixtures_task, season_task)
-    season_stats = season_stats if isinstance(season_stats, dict) else {}
-
-    stats_results = await asyncio.gather(
-        *(fixture_statistics(client, int(row["fixture"]["id"])) for row in fixtures),
-        return_exceptions=True,
-    )
-    matches: list[dict[str, Any]] = []
-    for fixture, stats_result in zip(fixtures, stats_results):
-        teams, goals, info = fixture.get("teams", {}), fixture.get("goals", {}), fixture.get("fixture", {})
-        is_home = teams.get("home", {}).get("id") == team_id
-        opponent = teams.get("away" if is_home else "home", {}).get("name")
-        gf = goals.get("home" if is_home else "away")
-        gc = goals.get("away" if is_home else "home")
-        if not opponent or gf is None or gc is None:
-            log.warning("Historial incompleto team=%s fixture=%s", team_id, info.get("id"))
-            continue
-        stats_available = isinstance(stats_result, dict) and bool(stats_result)
-        if not stats_available:
-            log.warning("Sin estadísticas oficiales fixture=%s team=%s: %s", info.get("id"), team_id, stats_result)
-        all_stats = stats_result if stats_available else {}
-        own = all_stats.get(team_id, {})
-        totals = {
-            metric: sum(team_stats.get(metric, 0.0) for team_stats in all_stats.values()) if stats_available else None
-            for metric in ("corners", "cards", "shots")
-        }
-        try:
-            date = datetime.fromisoformat(info["date"].replace("Z", "+00:00")).strftime("%d/%m")
-        except (KeyError, TypeError, ValueError):
-            date = ""
-        matches.append({
-            "rival": opponent, "score": f"{gf} - {gc}", "gf": int(gf), "gc": int(gc),
-            "resultado": "V" if gf > gc else "E" if gf == gc else "D", "fecha": date,
-            "corners": totals["corners"], "cards": totals["cards"], "shots": totals["shots"],
-            "corners_team": own.get("corners"), "cards_team": own.get("cards"), "shots_team": own.get("shots"),
-        })
-
-    goals = season_stats.get("goals") or {}
-    # Correct schema: average.total is itself a numeric string, not a dictionary.
-    gf_avg = number((((goals.get("for") or {}).get("average") or {}).get("total")), 1.20)
-    gc_avg = number((((goals.get("against") or {}).get("average") or {}).get("total")), 1.10)
-    result = {"matches": matches, "gf_avg": max(gf_avg, 0.05), "gc_avg": max(gc_avg, 0.05)}
-    return cache_put(key, result, TEAM_TTL)
+    async with _key_locks[key]:
+        if (hit := cached(key)) is not None:
+            return hit
+        fixtures_task = api_get(client, "/fixtures", {"team": team_id, "last": 5, "status": "FT"})
+        season_task = api_get(client, "/teams/statistics", {"team": team_id, "league": league_id, "season": season})
+        fixtures, season_stats = await asyncio.gather(fixtures_task, season_task)
+        season_stats = season_stats if isinstance(season_stats, dict) else {}
+        stats_results = await asyncio.gather(
+            *(fixture_statistics(client, int(row["fixture"]["id"])) for row in fixtures),
+            return_exceptions=True,
+        )
+        matches: list[dict[str, Any]] = []
+        for fixture, stats_result in zip(fixtures, stats_results):
+            teams, goals, info = fixture.get("teams", {}), fixture.get("goals", {}), fixture.get("fixture", {})
+            is_home = teams.get("home", {}).get("id") == team_id
+            opponent = teams.get("away" if is_home else "home", {}).get("name")
+            gf = goals.get("home" if is_home else "away")
+            gc = goals.get("away" if is_home else "home")
+            if not opponent or gf is None or gc is None:
+                continue
+            stats_available = isinstance(stats_result, dict) and bool(stats_result)
+            if not stats_available:
+                log.warning("Sin estadísticas oficiales fixture=%s team=%s: %s", info.get("id"), team_id, stats_result)
+            all_stats = stats_result if stats_available else {}
+            own = all_stats.get(team_id, {})
+            totals = {
+                metric: sum(team_stats.get(metric, 0.0) for team_stats in all_stats.values()) if stats_available else None
+                for metric in ("corners", "cards", "shots")
+            }
+            try:
+                played_at = datetime.fromisoformat(info["date"].replace("Z", "+00:00"))
+                date = played_at.strftime("%d/%m")
+                timestamp = played_at.timestamp()
+            except (KeyError, TypeError, ValueError):
+                date, timestamp = "", 0.0
+            matches.append({
+                "fixture_id": str(info.get("id") or ""), "timestamp": timestamp,
+                "rival": opponent, "score": f"{gf} - {gc}", "gf": int(gf), "gc": int(gc),
+                "resultado": "V" if gf > gc else "E" if gf == gc else "D", "fecha": date,
+                "corners": totals["corners"], "cards": totals["cards"], "shots": totals["shots"],
+                "corners_team": own.get("corners"), "cards_team": own.get("cards"), "shots_team": own.get("shots"),
+            })
+        goals = season_stats.get("goals") or {}
+        gf_avg = number((((goals.get("for") or {}).get("average") or {}).get("total")), 1.20)
+        gc_avg = number((((goals.get("against") or {}).get("average") or {}).get("total")), 1.10)
+        result = {"matches": matches, "gf_avg": max(gf_avg, 0.05), "gc_avg": max(gc_avg, 0.05)}
+        return cache_put(key, result, TEAM_TTL)
 
 
 def poisson_probability(k: int, lam: float) -> float:
@@ -217,6 +254,17 @@ def market_history(matches: list[dict[str, Any]], metric: str, line: float, over
             "valor_numerico": value, "cumple": value > line if over else value < line, "fecha": match["fecha"],
         })
     return result
+
+
+def btts_history(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "rival": match["rival"], "score": match["score"], "resultado": match["resultado"],
+            "valor_numerico": 1.0 if match["gf"] > 0 and match["gc"] > 0 else 0.0,
+            "cumple": match["gf"] > 0 and match["gc"] > 0, "fecha": match["fecha"],
+        }
+        for match in matches
+    ]
 
 
 def rate(matches: list[dict[str, Any]], metric: str, line: float, over: bool) -> float:
@@ -253,7 +301,13 @@ async def build_prop(client: httpx.AsyncClient, fixture: dict[str, Any]) -> dict
         team_data(client, int(home["id"]), int(league["id"]), int(league.get("season") or datetime.now().year)),
         team_data(client, int(away["id"]), int(league["id"]), int(league.get("season") or datetime.now().year)),
     )
-    home_matches, away_matches = home_data["matches"], away_data["matches"]
+    target_timestamp = datetime.fromisoformat(str(info["date"]).replace("Z", "+00:00")).timestamp()
+    target_id = str(info["id"])
+    def before_target(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        valid = [row for row in rows if row.get("fixture_id") != target_id and 0 < row.get("timestamp", 0) < target_timestamp]
+        return sorted(valid, key=lambda row: row["timestamp"], reverse=True)[:5]
+    home_matches = before_target(home_data["matches"])
+    away_matches = before_target(away_data["matches"])
     if not home_matches or not away_matches:
         raise RuntimeError(f"Historial oficial insuficiente: {home.get('name')} vs {away.get('name')}")
     enrich_goals(home_matches)
@@ -294,7 +348,7 @@ async def build_prop(client: httpx.AsyncClient, fixture: dict[str, Any]) -> dict
         "home_corners": hist(home_matches, "corners", corner_line), "away_corners": hist(away_matches, "corners", corner_line),
         "home_tarjetas": hist(home_matches, "cards", card_line, False), "away_tarjetas": hist(away_matches, "cards", card_line, False),
         "home_remates": hist(home_matches, "shots", shot_line), "away_remates": hist(away_matches, "shots", shot_line),
-        "home_btts": hist(home_matches, "goals", 1.5), "away_btts": hist(away_matches, "goals", 1.5),
+        "home_btts": btts_history(home_matches), "away_btts": btts_history(away_matches),
         "split_vs_list": [], "h2h_matches": [], "home_matches_20": home_goals, "away_matches_20": away_goals,
         "corners_label": "MÁS DE 8.5 CÓRNERS", "corners_conf": round((rate(home_matches, "corners", corner_line, True) + rate(away_matches, "corners", corner_line, True)) * 50),
         "corners_proyeccion": f"{(average(home_matches, 'corners') + average(away_matches, 'corners')) / 2:.1f}",
@@ -302,7 +356,7 @@ async def build_prop(client: httpx.AsyncClient, fixture: dict[str, Any]) -> dict
         "tarjetas_proyeccion": f"{(average(home_matches, 'cards') + average(away_matches, 'cards')) / 2:.1f}",
         "disparos_label": "MÁS DE 20.5 REMATES", "disparos_conf": round((rate(home_matches, "shots", shot_line, True) + rate(away_matches, "shots", shot_line, True)) * 50),
         "disparos_proyeccion": f"{(average(home_matches, 'shots') + average(away_matches, 'shots')) / 2:.1f}",
-        "btts_label": "AMBOS ANOTAN", "btts_conf": round(sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h]))) * 100),
+        "btts_label": "PROBABILIDAD AMBOS ANOTAN", "btts_conf": round(sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h]))) * 100),
         "btts_proyeccion": f"{lambda_home:.2f} - {lambda_away:.2f}",
         "cr_home_l10": f"{round(home_rate * 100)}%", "cr_away_l10": f"{round(away_rate * 100)}%", "cr_combinado_l10": f"{round((home_rate + away_rate) * 50)}%",
         "metrics_home": {"gf_prom": home_data["gf_avg"], "gc_prom": home_data["gc_avg"], "corn_prom": average(home_matches, "corners_team"), "tarj_prom": average(home_matches, "cards_team"), "rem_prom": average(home_matches, "shots_team")},
@@ -311,60 +365,137 @@ async def build_prop(client: httpx.AsyncClient, fixture: dict[str, Any]) -> dict
     }
 
 
-async def compute_props(client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    today = datetime.now(BOGOTA).strftime("%Y-%m-%d")
-    fixtures = await api_get(client, "/fixtures", {"date": today, "timezone": "America/Bogota"})
-    if not fixtures:
-        fixtures = await api_get(client, "/fixtures", {"next": MAX_FIXTURES, "timezone": "America/Bogota"})
-    fixtures = list(fixtures)[:MAX_FIXTURES]
-    results = await asyncio.gather(*(build_prop(client, fixture) for fixture in fixtures), return_exceptions=True)
-    props = []
-    for fixture, result in zip(fixtures, results):
-        if isinstance(result, Exception):
-            log.error(
-                "Fixture descartado id=%s: %s",
-                fixture.get("fixture", {}).get("id"), result,
-                exc_info=(type(result), result, result.__traceback__),
-            )
-        else:
-            props.append(result)
-    if fixtures and not props:
-        raise RuntimeError("Ningún fixture pudo construirse; revisa los errores anteriores")
-    props.sort(key=lambda row: (row["_sort"], row["_timestamp"], row["pais"]))
-    for row in props:
-        row.pop("_sort", None)
-        row.pop("_timestamp", None)
-    log.info("Respuesta construida con %s partidos independientes", len(props))
-    return props
+_catalog_date: str | None = None
+
+
+def catalog_prop(fixture: dict[str, Any]) -> dict[str, Any]:
+    info, league, teams = fixture.get("fixture", {}), fixture.get("league", {}), fixture.get("teams", {})
+    home, away = teams.get("home", {}), teams.get("away", {})
+    state = fixture_state(info)
+    flag, country = country_flag(str(league.get("country") or ""), str(league.get("name") or ""))
+    goals = fixture.get("goals") or {}
+    score_real = None if goals.get("home") is None else f"{goals.get('home')} - {goals.get('away')}"
+    unavailable = state["is_finished"] or state["is_live"]
+    return {
+        "id": str(info.get("id") or ""), "liga": f"{flag}  {country} • {str(league.get('name') or 'Liga')}",
+        "pais": country, "bandera": flag, "home_name": home.get("name") or "Equipo local",
+        "away_name": away.get("name") or "Equipo visitante", "home_logo": home.get("logo") or "",
+        "away_logo": away.get("logo") or "", "fecha": state["display"], "status_code": state["code"],
+        "status_display": state["display"], "is_live": state["is_live"], "is_finished": state["is_finished"],
+        "score_real": score_real, "status_verdict": "SIN_SNAPSHOT_PREVIO" if unavailable else "ANALISIS_PENDIENTE",
+        "p_home": 0, "p_draw": 0, "p_away": 0, "prob_1x2": "PENDIENTE",
+        "marcador_estimado": "—", "mercado": "ANÁLISIS ESTADÍSTICO", "cr_mercado": "N/D", "cr_score_num": "0",
+        "home_goles": [], "away_goles": [], "home_corners": [], "away_corners": [],
+        "home_tarjetas": [], "away_tarjetas": [], "home_remates": [], "away_remates": [],
+        "analysis_status": "UNAVAILABLE" if unavailable else "PENDING",
+        "analysis_message": "No existe snapshot previo al inicio" if unavailable else "Esperando procesamiento",
+        "data_quality": 0, "sample_size": 0, "_sort": state["sort"], "_timestamp": state.get("timestamp", 0),
+    }
+
+
+def public_prop(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if not key.startswith("_")}
+
+
+def merged_props() -> list[dict[str, Any]]:
+    rows = []
+    for fixture in _catalog:
+        shell = catalog_prop(fixture)
+        row = _analyses.get(shell["id"], shell)
+        if shell["id"] in _analysis_errors:
+            row = {**shell, "analysis_status": "ERROR", "analysis_message": _analysis_errors[shell["id"]]}
+        rows.append(row)
+    rows.sort(key=lambda row: (row.get("_sort", 1), row.get("_timestamp", 0), row.get("pais", "")))
+    return [public_prop(row) for row in rows]
+
+
+async def analyze_catalog(fixtures: list[dict[str, Any]]) -> None:
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    for fixture in fixtures:
+        shell = catalog_prop(fixture)
+        if shell["analysis_status"] == "PENDING" and shell["id"] not in _analyses:
+            queue.put_nowait(fixture)
+
+    async def worker() -> None:
+        timeout = httpx.Timeout(connect=10, read=20, write=10, pool=20)
+        async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
+            while True:
+                try:
+                    fixture = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                fixture_id = str(fixture.get("fixture", {}).get("id") or "")
+                try:
+                    result = await build_prop(client, fixture)
+                    result["status_verdict"] = "ANALISIS_LISTO"
+                    result["analysis_status"] = "READY"
+                    result["analysis_message"] = "Análisis estadístico disponible"
+                    result["sample_size"] = min(len(result.get("home_goles", [])), len(result.get("away_goles", []))) * 2
+                    advanced = sum(bool(result.get(key)) for key in ("home_corners", "away_corners", "home_tarjetas", "away_tarjetas", "home_remates", "away_remates"))
+                    result["data_quality"] = round(55 + advanced / 6 * 45)
+                    _analyses[fixture_id] = result
+                    _analysis_errors.pop(fixture_id, None)
+                except Exception as exc:
+                    _analysis_errors[fixture_id] = str(exc)
+                    log.error("Análisis fallido fixture=%s: %s", fixture_id, exc)
+                finally:
+                    queue.task_done()
+
+    await asyncio.gather(*(worker() for _ in range(ANALYSIS_WORKERS)))
+    log.info("Procesamiento diario terminado: %s listos, %s fallidos", len(_analyses), len(_analysis_errors))
+
+
+async def load_catalog(date: str, force: bool) -> None:
+    global _catalog, _catalog_date, _analysis_task, _sync_started_at
+    async with _refresh_lock:
+        if _catalog and _catalog_date == date and not force:
+            return
+        timeout = httpx.Timeout(connect=10, read=20, write=10, pool=20)
+        async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
+            fixtures = await api_get(client, "/fixtures", {"date": date, "timezone": "America/Bogota"})
+        if _catalog_date != date:
+            _analyses.clear()
+            _analysis_errors.clear()
+        _catalog, _catalog_date = list(fixtures), date
+        _sync_started_at = datetime.now(BOGOTA).isoformat()
+        if _analysis_task is None or _analysis_task.done():
+            _analysis_task = asyncio.create_task(analyze_catalog(_catalog.copy()))
 
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    return {"status": "ok", "service": "S2S Sigma Engine", "version": "3.0.0", "api_key_configured": bool(API_KEY)}
+    return {"status": "ok", "service": "S2S Sigma Engine", "version": "4.0.0", "api_key_configured": bool(API_KEY)}
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    response = cached("props")
-    return {"status": "ok", "api_key_configured": bool(API_KEY), "cached_matches": len(response or []), "max_fixtures": MAX_FIXTURES}
+    return {"status": "ok", "api_key_configured": bool(API_KEY), "catalog_matches": len(_catalog), "ready_matches": len(_analyses), "analysis_running": bool(_analysis_task and not _analysis_task.done())}
+
+
+@app.get("/api/v1/sync")
+async def sync_status() -> dict[str, Any]:
+    total = len(_catalog)
+    unavailable = sum(catalog_prop(fixture)["analysis_status"] == "UNAVAILABLE" for fixture in _catalog)
+    eligible = max(total - unavailable, 0)
+    ready, failed = len(_analyses), len(_analysis_errors)
+    completed = min(ready + failed, eligible)
+    return {
+        "date": _catalog_date, "total": total, "eligible": eligible, "ready": ready,
+        "pending": max(eligible - completed, 0), "unavailable": unavailable, "failed": failed,
+        "progress": completed / max(eligible, 1), "running": bool(_analysis_task and not _analysis_task.done()),
+        "started_at": _sync_started_at,
+    }
 
 
 @app.get("/api/v1/props")
-async def get_props(all: bool = Query(True), refresh: bool = Query(False)) -> list[dict[str, Any]]:
+async def get_props(all: bool = Query(True), refresh: bool = Query(False), date: str | None = Query(None)) -> list[dict[str, Any]]:
     del all  # Kept for Android contract compatibility.
-    if not refresh and (hit := cached("props")) is not None:
-        return hit
-    async with _refresh_lock:
-        if not refresh and (hit := cached("props")) is not None:
-            return hit
-        try:
-            timeout = httpx.Timeout(connect=10, read=15, write=10, pool=10)
-            async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
-                return cache_put("props", await compute_props(client), RESPONSE_TTL)
-        except Exception as exc:
-            log.exception("No se pudo construir /api/v1/props")
-            stale = _cache.get("props")
-            if stale:
-                log.warning("Entregando última respuesta conocida por fallo temporal")
-                return stale[1]
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    requested_date = date or datetime.now(BOGOTA).strftime("%Y-%m-%d")
+    try:
+        await load_catalog(requested_date, refresh)
+        return merged_props()
+    except Exception as exc:
+        log.exception("No se pudo cargar el catálogo diario")
+        if _catalog and _catalog_date == requested_date:
+            return merged_props()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc

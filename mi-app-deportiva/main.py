@@ -26,7 +26,7 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 
 ENGINE_VERSION = "5.0.0"
 CONTRACT_VERSION = "5.0"
@@ -52,6 +52,7 @@ SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "6")))
 DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.08")), 0.05))
 DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
+ADMIN_TOKEN = os.getenv("S2S_ADMIN_TOKEN", "").strip()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("S2S")
@@ -68,6 +69,8 @@ _analysis_task: asyncio.Task[None] | None = None
 _analysis_errors: dict[str, str] = {}
 _progress = {"phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0, "overall_total": 1.0, "started_at": None}
 _quota = {"daily_remaining": None, "minute_remaining": None, "last_call_at": None}
+_calibration_task: asyncio.Task[None] | None = None
+_calibration_state: dict[str, Any] = {"running": False, "started_at": None, "finished_at": None, "error": None, "run_id": None}
 
 
 class PacedRateLimiter:
@@ -153,6 +156,15 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS calibration_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                promoted INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL
+            )"""
+        )
         db.commit()
 
 
@@ -191,6 +203,20 @@ def db_save_snapshot(fixture_date: str, fixture_id: str, cutoff: str, payload: d
             ),
         )
         db.commit()
+
+
+def db_latest_calibration() -> dict[str, Any] | None:
+    with sqlite3.connect(STATE_DB_PATH) as db:
+        row = db.execute(
+            "SELECT id, created_at, status, promoted, payload FROM calibration_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[4])
+    except json.JSONDecodeError:
+        return {"run_id": row[0], "created_at": row[1], "status": "CORRUPT", "promoted": False}
+    return {**payload, "run_id": row[0], "created_at": row[1], "status": row[2], "promoted": bool(row[3])}
 
 
 init_db()
@@ -909,6 +935,37 @@ def sync_payload() -> dict[str, Any]:
     }
 
 
+async def execute_calibration(date: str, max_leagues: int, advanced: bool) -> None:
+    global _calibration_state
+    _calibration_state = {
+        "running": True, "started_at": datetime.now(UTC).isoformat(),
+        "finished_at": None, "error": None, "run_id": None,
+    }
+    try:
+        # Importación diferida: calibration reutiliza las primitivas verificadas
+        # de este módulo sin crear un ciclo durante el arranque de Uvicorn.
+        import calibration
+
+        report = await calibration.run_calibration(date, max_leagues, advanced)
+        _calibration_state["run_id"] = report.get("run_id")
+        _calibration_state.update({"phase": "COMPLETE", "done": 1, "total": 1, "progress": 1.0})
+    except Exception as exc:
+        log.exception("Calibración histórica fallida")
+        _calibration_state["error"] = str(exc)
+    finally:
+        _calibration_state["running"] = False
+        _calibration_state["finished_at"] = datetime.now(UTC).isoformat()
+
+
+def require_admin(token: str | None) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="S2S_ADMIN_TOKEN no está configurado")
+    # compare_digest reduce filtraciones temporales al validar el secreto.
+    import hmac
+    if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Token administrativo inválido")
+
+
 @app.get("/")
 async def root() -> dict[str, Any]:
     return {
@@ -930,12 +987,54 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/v1/meta")
 async def meta() -> dict[str, Any]:
+    latest = db_latest_calibration()
     return {
         "contract_version": CONTRACT_VERSION, "engine_version": ENGINE_VERSION,
-        "model_version": MODEL_VERSION, "calibration_status": "NOT_CALIBRATED",
+        "model_version": MODEL_VERSION,
+        "calibration_status": latest.get("status") if latest else "NOT_CALIBRATED",
+        "calibration_run_id": latest.get("run_id") if latest else None,
         "viability_status": "NOT_CERTIFIED", "timezone": "America/Bogota",
         "rate_policy": {"configured_per_minute": REQUESTS_PER_MINUTE, "hard_maximum": 420, "pacing": "uniform"},
         "disclaimer": "Análisis estadístico deportivo; no constituye recomendación de apuesta.",
+    }
+
+
+@app.get("/api/v1/calibration/status")
+async def calibration_status() -> dict[str, Any]:
+    latest = db_latest_calibration()
+    summary = None
+    if latest:
+        summary = {
+            "run_id": latest.get("run_id"), "created_at": latest.get("created_at"),
+            "status": latest.get("status"), "promoted": latest.get("promoted", False),
+            "points": latest.get("points"), "train_n": latest.get("train_n"),
+            "holdout_n": latest.get("holdout_n"), "parameters": latest.get("parameters"),
+            "holdout": latest.get("holdout"), "advanced": latest.get("advanced", {}),
+            "promotion_policy": latest.get("promotion_policy"),
+        }
+    return {"task": _calibration_state, "latest": summary}
+
+
+@app.post("/api/v1/calibration/run", status_code=202)
+async def start_calibration(
+    date: str | None = Query(None),
+    max_leagues: int = Query(30, ge=1, le=100),
+    advanced: bool = Query(True),
+    x_s2s_admin: str | None = Header(None, alias="X-S2S-Admin"),
+) -> dict[str, Any]:
+    global _calibration_task
+    require_admin(x_s2s_admin)
+    if _calibration_task and not _calibration_task.done():
+        raise HTTPException(status_code=409, detail="Ya existe una calibración en ejecución")
+    requested = date or now_local().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(requested, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="date debe usar YYYY-MM-DD") from exc
+    _calibration_task = asyncio.create_task(execute_calibration(requested, max_leagues, advanced))
+    return {
+        "accepted": True, "date": requested, "max_leagues": max_leagues,
+        "advanced": advanced, "message": "Backtesting cronológico iniciado; consulta /api/v1/calibration/status",
     }
 
 

@@ -1,4 +1,256 @@
+"""S2S Sigma Engine v5.
 
+Render start command:
+    uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Required environment variable:
+    API_FOOTBALL_KEY
+
+This service publishes sports evidence and probabilistic estimates. It does not
+publish betting recommendations, odds, edge, expected value, or certified
+viability. Until an external backtest calibrates the model, viability is null.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import sqlite3
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+
+ENGINE_VERSION = "5.0.0"
+CONTRACT_VERSION = "5.0"
+MODEL_VERSION = "dc-shrunk-v1-uncalibrated"
+BASE_URL = "https://v3.football.api-sports.io"
+BOGOTA = ZoneInfo("America/Bogota")
+UTC = timezone.utc
+
+API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+REQUESTS_PER_MINUTE = max(60, min(int(os.getenv("REQUESTS_PER_MINUTE", "360")), 420))
+HTTP_CONCURRENCY = max(2, min(int(os.getenv("HTTP_CONCURRENCY", "12")), 20))
+ANALYSIS_WORKERS = max(1, min(int(os.getenv("ANALYSIS_WORKERS", "8")), 12))
+CATALOG_TTL = max(30, int(os.getenv("CATALOG_TTL_SECONDS", "60")))
+TEAM_TTL = max(900, int(os.getenv("TEAM_TTL_SECONDS", "21600")))
+LEAGUE_TTL = max(900, int(os.getenv("LEAGUE_TTL_SECONDS", "21600")))
+FIXTURE_STATS_TTL = max(3600, int(os.getenv("FIXTURE_STATS_TTL_SECONDS", "86400")))
+H2H_TTL = max(3600, int(os.getenv("H2H_TTL_SECONDS", "86400")))
+HISTORY_SIZE = max(5, min(int(os.getenv("HISTORY_SIZE", "10")), 20))
+MIN_HISTORY = max(3, min(int(os.getenv("MIN_HISTORY", "5")), HISTORY_SIZE))
+MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
+STALE_NS_MINUTES = max(90, int(os.getenv("STALE_NS_MINUTES", "180")))
+SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "6")))
+DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.08")), 0.05))
+DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("S2S")
+app = FastAPI(title="S2S Sigma Engine", version=ENGINE_VERSION)
+
+_http_slots = asyncio.Semaphore(HTTP_CONCURRENCY)
+_catalog_lock = asyncio.Lock()
+_key_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_memory_cache: dict[str, tuple[float, Any]] = {}
+_catalog: list[dict[str, Any]] = []
+_catalog_date: str | None = None
+_catalog_loaded_monotonic = 0.0
+_analysis_task: asyncio.Task[None] | None = None
+_analysis_errors: dict[str, str] = {}
+_progress = {"phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0, "overall_total": 1.0, "started_at": None}
+_quota = {"daily_remaining": None, "minute_remaining": None, "last_call_at": None}
+
+
+class PacedRateLimiter:
+    """Evenly spaces calls; never emits a large initial burst."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        self.interval = 60.0 / requests_per_minute
+        self.next_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self.lock:
+            now = time.monotonic()
+            wait = max(0.0, self.next_at - now)
+            self.next_at = max(now, self.next_at) + self.interval
+        if wait:
+            await asyncio.sleep(wait)
+
+
+_limiter = PacedRateLimiter(REQUESTS_PER_MINUTE)
+
+
+def now_local() -> datetime:
+    return datetime.now(BOGOTA)
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+def as_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value is None or value == "":
+            return default
+        if isinstance(value, str):
+            value = value.replace("%", "").strip()
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(value, high))
+
+
+def cache_get(key: str) -> Any | None:
+    item = _memory_cache.get(key)
+    if item and item[0] > time.monotonic():
+        return item[1]
+    _memory_cache.pop(key, None)
+    return None
+
+
+def cache_put(key: str, value: Any, ttl: int) -> Any:
+    _memory_cache[key] = (time.monotonic() + ttl, value)
+    return value
+
+
+def chunks(values: Iterable[int], size: int = 20) -> list[list[int]]:
+    rows = list(values)
+    return [rows[index:index + size] for index in range(0, len(rows), size)]
+
+
+def init_db() -> None:
+    path = Path(STATE_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS snapshots (
+                fixture_id TEXT PRIMARY KEY,
+                fixture_date TEXT NOT NULL,
+                cutoff_utc TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        db.commit()
+
+
+def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
+    with sqlite3.connect(STATE_DB_PATH) as db:
+        rows = db.execute(
+            "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=?", (fixture_date,)
+        ).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for fixture_id, payload in rows:
+        try:
+            result[str(fixture_id)] = json.loads(payload)
+        except json.JSONDecodeError:
+            log.warning("Snapshot corrupto fixture=%s", fixture_id)
+    return result
+
+
+def db_save_snapshot(fixture_date: str, fixture_id: str, cutoff: str, payload: dict[str, Any]) -> None:
+    with sqlite3.connect(STATE_DB_PATH) as db:
+        db.execute(
+            """INSERT INTO snapshots(fixture_id, fixture_date, cutoff_utc, model_version, payload, created_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(fixture_id) DO UPDATE SET
+                 fixture_date=excluded.fixture_date,
+                 cutoff_utc=excluded.cutoff_utc,
+                 model_version=excluded.model_version,
+                 payload=excluded.payload,
+                 created_at=excluded.created_at""",
+            (
+                fixture_id,
+                fixture_date,
+                cutoff,
+                MODEL_VERSION,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        db.commit()
+
+
+init_db()
+_snapshots: dict[str, dict[str, Any]] = {}
+
+
+async def provider_get(
+    client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, Any],
+    attempts: int = 4,
+) -> list[Any] | dict[str, Any]:
+    if not API_KEY:
+        raise RuntimeError("Falta API_FOOTBALL_KEY en Render")
+    last_error = "Error desconocido"
+    for attempt in range(attempts):
+        try:
+            await _limiter.acquire()
+            async with _http_slots:
+                response = await client.get(path, params=params)
+            _quota["daily_remaining"] = response.headers.get("x-ratelimit-requests-remaining")
+            _quota["minute_remaining"] = response.headers.get("x-ratelimit-remaining")
+            _quota["last_call_at"] = datetime.now(UTC).isoformat()
+            if response.status_code == 429:
+                retry_after = int(as_float(response.headers.get("Retry-After"), 60.0) or 60)
+                last_error = f"HTTP 429 en {path}"
+                log.warning("%s; reintento en %ss", last_error, retry_after)
+                await asyncio.sleep(max(5, retry_after))
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            errors = payload.get("errors") or {}
+            if errors:
+                last_error = f"API-Football rechazó {path}: {errors}"
+                if "rateLimit" in str(errors):
+                    await asyncio.sleep(60)
+                    continue
+                raise RuntimeError(last_error)
+            return payload.get("response", [])
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            last_error = str(exc)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(8.0, 0.75 * (2**attempt)))
+    raise RuntimeError(last_error)
+
+
+LIVE_CODES = {"1H", "HT", "2H", "ET", "BT", "P", "LIVE", "INT"}
+FINISHED_CODES = {"FT", "AET", "PEN"}
+STOPPED_CODES = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP"}
+SCHEDULED_CODES = {"NS", "TBD"}
+
+
+def fixture_state(info: dict[str, Any]) -> dict[str, Any]:
+    status = info.get("status") or {}
+    official = str(status.get("short") or "TBD").upper()
+    kickoff = parse_dt(info.get("date"))
+    local = kickoff.astimezone(BOGOTA) if kickoff else None
+    now = now_local()
+    elapsed = int(as_float(status.get("elapsed"), 0.0) or 0)
+    stale = bool(local and official in SCHEDULED_CODES and now > local + timedelta(minutes=STALE_NS_MINUTES))
 
     if official in LIVE_CODES:
         interpreted, label, group = "LIVE", f"EN VIVO · {elapsed}'", "LIVE"

@@ -783,7 +783,14 @@ def merged_props() -> list[dict[str, Any]]:
             row = {**snapshot, **{key: shell[key] for key in live_fields}}
         if shell["fixture_id"] in _analysis_errors and not snapshot:
             message = _analysis_errors[shell["fixture_id"]]
-            row = {**shell, "analysis_status": "ERROR", "analysis_message": message, "abstention_reasons": [message]}
+            started_during_run = message == "La hora de inicio ya pasó; no se fabricará un snapshot retrospectivo"
+            row = {
+                **shell,
+                "analysis_status": "UNAVAILABLE" if started_during_run else "ERROR",
+                "analysis_message": message,
+                "status_verdict": "INICIO_SUPERADO" if started_during_run else "ERROR_TECNICO",
+                "abstention_reasons": [] if started_during_run else [message],
+            }
         rows.append(row)
     rows.sort(key=lambda row: (row.get("_sort", 9), row.get("_timestamp", 0), row.get("league_name", "")))
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]

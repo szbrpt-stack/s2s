@@ -28,7 +28,7 @@ BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 HTTP_CONCURRENCY = max(2, min(int(os.getenv("HTTP_CONCURRENCY", "8")), 16))
 ANALYSIS_WORKERS = max(1, min(int(os.getenv("ANALYSIS_WORKERS", "4")), 8))
-REQUESTS_PER_MINUTE = max(30, min(int(os.getenv("REQUESTS_PER_MINUTE", "240")), 420))
+REQUESTS_PER_MINUTE = max(30, min(int(os.getenv("REQUESTS_PER_MINUTE", "120")), 120))
 RESPONSE_TTL = int(os.getenv("RESPONSE_TTL_SECONDS", "900"))
 TEAM_TTL = int(os.getenv("TEAM_TTL_SECONDS", "21600"))
 FIXTURE_STATS_TTL = int(os.getenv("FIXTURE_STATS_TTL_SECONDS", "86400"))
@@ -100,11 +100,19 @@ async def api_get(client: httpx.AsyncClient, path: str, params: dict[str, Any]) 
             await _provider_limiter.acquire()
             async with _request_slots:
                 response = await client.get(path, params=params)
+            if response.status_code == 429:
+                last_error = RuntimeError(f"API-Sports rate limit HTTP 429 en {path}")
+                await asyncio.sleep(number(response.headers.get("Retry-After"), 60.0))
+                continue
             response.raise_for_status()
             payload = response.json()
             errors = payload.get("errors")
             if errors:
-                raise RuntimeError(f"API-Sports rechazó la consulta {path}: {errors}")
+                last_error = RuntimeError(f"API-Sports rechazó la consulta {path}: {errors}")
+                if isinstance(errors, dict) and "rateLimit" in errors:
+                    await asyncio.sleep(60)
+                    continue
+                raise last_error
             return payload.get("response", [])
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             last_error = exc

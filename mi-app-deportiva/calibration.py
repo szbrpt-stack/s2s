@@ -135,8 +135,8 @@ def predict(point: BacktestPoint, rho: float, k: float, recency_strength: float)
     aa = shrunk(mean(point.away_away_against), base_h, len(point.away_away_against), k)
     home_recent = weighted_recent(point.home_recent_for)
     away_recent = weighted_recent(point.away_recent_for)
-    home_ratio = clamp((home_recent / max(mean(point.home_recent_for) or base_h, 0.2)), 0.8, 1.2) if home_recent else 1.0
-    away_ratio = clamp((away_recent / max(mean(point.away_recent_for) or base_a, 0.2)), 0.8, 1.2) if away_recent else 1.0
+    home_ratio = clamp((home_recent / max(mean(point.home_recent_for) or base_h, 0.2)), 0.85, 1.15) if home_recent else 1.0
+    away_ratio = clamp((away_recent / max(mean(point.away_recent_for) or base_a, 0.2)), 0.85, 1.15) if away_recent else 1.0
     lambda_h = clamp(base_h * (hf / base_h) * (aa / base_h) * (home_ratio**recency_strength), 0.15, 4.5)
     lambda_a = clamp(base_a * (af / base_a) * (ha / base_a) * (away_ratio**recency_strength), 0.15, 4.5)
     scores = matrix(lambda_h, lambda_a, rho)
@@ -242,6 +242,45 @@ def calibration_bins(points: list[BacktestPoint], rho: float, k: float, recency:
         "mean_prediction": round(sum(row[0] for row in rows) / len(rows), 4),
         "observed_frequency": round(sum(row[1] for row in rows) / len(rows), 4),
     } for bucket, rows in sorted(bins.items()) if rows]
+
+
+def expected_calibration_error(bins: list[dict[str, Any]]) -> float:
+    total = sum(int(row["n"]) for row in bins)
+    if total <= 0:
+        return 0.0
+    return round(sum(int(row["n"]) * abs(float(row["mean_prediction"]) - float(row["observed_frequency"])) for row in bins) / total, 6)
+
+
+def naive_baseline(train: list[BacktestPoint], test: list[BacktestPoint]) -> dict[str, Any]:
+    counts = [1.0, 1.0, 1.0]
+    over_count = 1.0
+    score_counts: defaultdict[tuple[int, int], int] = defaultdict(int)
+    for point in train:
+        counts[outcome_index(point)] += 1
+        over_count += int(point.home_goals + point.away_goals >= 3)
+        score_counts[(point.home_goals, point.away_goals)] += 1
+    total = sum(counts)
+    probabilities = tuple(value / total for value in counts)
+    over_probability = over_count / (len(train) + 2)
+    modal = max(score_counts, key=score_counts.get) if score_counts else (1, 1)
+    if not test:
+        return {"n": 0}
+    log_loss = brier = over_brier = correct = modal_correct = 0.0
+    predicted = max(range(3), key=lambda index: probabilities[index])
+    for point in test:
+        actual = outcome_index(point)
+        log_loss -= math.log(max(probabilities[actual], EPS))
+        brier += sum((probability - (1.0 if index == actual else 0.0)) ** 2 for index, probability in enumerate(probabilities))
+        correct += int(predicted == actual)
+        actual_over = 1.0 if point.home_goals + point.away_goals >= 3 else 0.0
+        over_brier += (over_probability - actual_over) ** 2
+        modal_correct += int(modal == (point.home_goals, point.away_goals))
+    n = len(test)
+    return {
+        "n": n, "log_loss": round(log_loss / n, 6), "brier_1x2": round(brier / n, 6),
+        "accuracy_1x2": round(correct / n, 6), "brier_over25": round(over_brier / n, 6),
+        "modal_accuracy": round(modal_correct / n, 6),
+    }
 
 
 def choose_parameters(train: list[BacktestPoint]) -> tuple[dict[str, float], dict[str, Any]]:
@@ -375,9 +414,12 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             return report
 
         progress("PARAMETER_SEARCH", 0, 1)
-        params, train_score = choose_parameters(train)
+        params, train_score = await asyncio.to_thread(choose_parameters, train)
         progress("PARAMETER_SEARCH", 1, 1)
-        holdout_score = score_points(holdout, params["rho"], params["shrinkage"], params["recency"])
+        holdout_score = await asyncio.to_thread(score_points, holdout, params["rho"], params["shrinkage"], params["recency"])
+        current_model_holdout = await asyncio.to_thread(score_points, holdout, -0.08, 6.0, 1.0)
+        naive_holdout = await asyncio.to_thread(naive_baseline, train, holdout)
+        bins = await asyncio.to_thread(calibration_bins, holdout, params["rho"], params["shrinkage"], params["recency"])
         per_league: dict[str, Any] = {}
         for key, points in league_points.items():
             if len(points) < 60:
@@ -385,10 +427,10 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
                 continue
             league_split = int(len(points) * 0.7)
             league_train, league_test = points[:league_split], points[league_split:]
-            league_params, _ = choose_parameters(league_train)
+            league_params, _ = await asyncio.to_thread(choose_parameters, league_train)
             per_league[key] = {
                 "status": "EVALUATED", "parameters": league_params,
-                "holdout": score_points(league_test, league_params["rho"], league_params["shrinkage"], league_params["recency"]),
+                "holdout": await asyncio.to_thread(score_points, league_test, league_params["rho"], league_params["shrinkage"], league_params["recency"]),
             }
 
         advanced = {}
@@ -397,14 +439,30 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             max_fixture_stats = remaining_calls * 20
             advanced_ids = [point.fixture_id for point in all_points[:max_fixture_stats]]
             advanced_stats = await fetch_advanced(client, advanced_ids)
-            advanced = advanced_report(all_points, advanced_stats)
+            advanced = await asyncio.to_thread(advanced_report, all_points, advanced_stats)
+
+        improvement = {
+            "vs_current_log_loss_pct": round(100 * (current_model_holdout["log_loss"] - holdout_score["log_loss"]) / current_model_holdout["log_loss"], 4),
+            "vs_current_brier_pct": round(100 * (current_model_holdout["brier_1x2"] - holdout_score["brier_1x2"]) / current_model_holdout["brier_1x2"], 4),
+            "vs_naive_log_loss_pct": round(100 * (naive_holdout["log_loss"] - holdout_score["log_loss"]) / naive_holdout["log_loss"], 4),
+            "vs_naive_brier_pct": round(100 * (naive_holdout["brier_1x2"] - holdout_score["brier_1x2"]) / naive_holdout["brier_1x2"], 4),
+        }
+        promotion_candidate = (
+            len(holdout) >= 500
+            and improvement["vs_current_log_loss_pct"] > 1.0
+            and improvement["vs_current_brier_pct"] > 1.0
+            and improvement["vs_naive_log_loss_pct"] > 0.0
+            and improvement["vs_naive_brier_pct"] > 0.0
+        )
 
         report = {
             "status": "EVALUATED_NOT_PROMOTED", "date": date,
             "created_at": datetime.now(main.UTC).isoformat(), "leagues_requested": len(selected),
             "leagues_loaded": len(league_points), "points": len(all_points), "train_n": len(train), "holdout_n": len(holdout),
             "parameters": params, "train": train_score, "holdout": holdout_score,
-            "calibration_bins": calibration_bins(holdout, params["rho"], params["shrinkage"], params["recency"]),
+            "current_model_holdout": current_model_holdout, "naive_holdout": naive_holdout,
+            "improvement": improvement, "promotion_candidate": promotion_candidate,
+            "calibration_bins": bins, "expected_calibration_error": expected_calibration_error(bins),
             "per_league": per_league, "advanced": advanced, "provider_errors": errors,
             "api_budget": {"configured_calls": CALL_BUDGET, "advanced_fixtures_requested": len(advanced_ids) if include_advanced else 0},
             "leakage_policy": "Cada predicción usa únicamente fixtures anteriores al kickoff.",

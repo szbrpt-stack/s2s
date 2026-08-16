@@ -1010,6 +1010,11 @@ async def calibration_status() -> dict[str, Any]:
             "points": latest.get("points"), "train_n": latest.get("train_n"),
             "holdout_n": latest.get("holdout_n"), "parameters": latest.get("parameters"),
             "holdout": latest.get("holdout"), "advanced": latest.get("advanced", {}),
+            "current_model_holdout": latest.get("current_model_holdout"),
+            "naive_holdout": latest.get("naive_holdout"),
+            "improvement": latest.get("improvement"),
+            "expected_calibration_error": latest.get("expected_calibration_error"),
+            "promotion_candidate": latest.get("promotion_candidate", False),
             "promotion_policy": latest.get("promotion_policy"),
         }
     return {"task": _calibration_state, "latest": summary}

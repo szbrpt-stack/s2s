@@ -20,6 +20,7 @@ import os
 import sqlite3
 import time
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,7 +34,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "5.2.0"
+ENGINE_VERSION = "5.3.0"
 CONTRACT_VERSION = "5.0"
 MODEL_VERSION = "dc-shrunk-v2-walk-forward-validated"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_VALIDATED_NOT_EXTERNALLY_CERTIFIED"
@@ -165,11 +166,15 @@ def init_db() -> None:
                 status TEXT NOT NULL, promoted INTEGER NOT NULL DEFAULT 0,
                 payload TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS advanced_fixture_stats (
+                fixture_id BIGINT PRIMARY KEY, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""")
         log.info("Persistencia PostgreSQL inicializada")
         return
     path = Path(STATE_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute(
             """CREATE TABLE IF NOT EXISTS snapshots (
@@ -190,6 +195,13 @@ def init_db() -> None:
                 payload TEXT NOT NULL
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS advanced_fixture_stats (
+                fixture_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
         db.commit()
 
 
@@ -200,7 +212,7 @@ def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
                 "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=%s", (fixture_date,)
             ).fetchall()
     else:
-        with sqlite3.connect(STATE_DB_PATH) as db:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
             rows = db.execute(
                 "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=?", (fixture_date,)
             ).fetchall()
@@ -226,7 +238,7 @@ def db_save_snapshot(fixture_date: str, fixture_id: str, cutoff: str, payload: d
         with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
             db.execute(statement.format(placeholders="%s,%s,%s,%s,%s,%s"), values)
     else:
-        with sqlite3.connect(STATE_DB_PATH) as db:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
             db.execute(statement.format(placeholders="?,?,?,?,?,?"), values)
             db.commit()
 
@@ -237,7 +249,7 @@ def db_latest_calibration() -> dict[str, Any] | None:
         with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
             row = db.execute(query).fetchone()
     else:
-        with sqlite3.connect(STATE_DB_PATH) as db:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
             row = db.execute(query).fetchone()
     if not row:
         return None
@@ -258,13 +270,63 @@ def db_save_calibration(report: dict[str, Any]) -> int:
                 (created_at, report["status"], payload),
             ).fetchone()
             return int(row[0])
-    with sqlite3.connect(STATE_DB_PATH) as db:
+    with closing(sqlite3.connect(STATE_DB_PATH)) as db:
         cursor = db.execute(
             "INSERT INTO calibration_runs(created_at,status,promoted,payload) VALUES(?,?,0,?)",
             (created_at, report["status"], payload),
         )
         db.commit()
         return int(cursor.lastrowid)
+
+
+def db_load_advanced_stats(fixture_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not fixture_ids:
+        return {}
+    result: dict[int, dict[str, Any]] = {}
+    for batch in chunks(fixture_ids, 500):
+        if DATABASE_URL:
+            with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+                rows = db.execute(
+                    "SELECT fixture_id,payload FROM advanced_fixture_stats WHERE fixture_id = ANY(%s)",
+                    (batch,),
+                ).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in batch)
+            with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+                rows = db.execute(
+                    f"SELECT fixture_id,payload FROM advanced_fixture_stats WHERE fixture_id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+        for fixture_id, payload in rows:
+            try:
+                result[int(fixture_id)] = json.loads(payload)
+            except json.JSONDecodeError:
+                log.warning("Estadística avanzada corrupta fixture=%s", fixture_id)
+    return result
+
+
+def db_save_advanced_stats(rows: dict[int, dict[str, Any]]) -> None:
+    if not rows:
+        return
+    created_at = datetime.now(UTC).isoformat()
+    values = [(fixture_id, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), created_at)
+              for fixture_id, payload in rows.items()]
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            with db.cursor() as cursor:
+                cursor.executemany(
+                    """INSERT INTO advanced_fixture_stats(fixture_id,payload,created_at) VALUES(%s,%s,%s)
+                       ON CONFLICT(fixture_id) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at""",
+                    values,
+                )
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            db.executemany(
+                """INSERT INTO advanced_fixture_stats(fixture_id,payload,created_at) VALUES(?,?,?)
+                   ON CONFLICT(fixture_id) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at""",
+                values,
+            )
+            db.commit()
 
 
 init_db()

@@ -30,8 +30,8 @@ from fastapi import FastAPI, Header, HTTPException, Query
 
 ENGINE_VERSION = "5.0.0"
 CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v2-backtest-candidate"
-MODEL_VALIDATION_STATUS = "BACKTEST_CANDIDATE_NOT_CERTIFIED"
+MODEL_VERSION = "dc-shrunk-v2-walk-forward-validated"
+MODEL_VALIDATION_STATUS = "WALK_FORWARD_VALIDATED_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 UTC = timezone.utc
@@ -755,7 +755,7 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "sample_size": len(home["matches"]) + len(away["matches"]),
         "confidence": {
             "status": MODEL_VALIDATION_STATUS,
-            "reason": "Candidato mejora holdout 1X2; pendiente de validación multiventana y certificación externa",
+            "reason": "Validado internamente en 4/4 ventanas para 1X2/goles; pendiente de certificación externa",
         },
         "viability": None, "viability_status": "NOT_CERTIFIED",
         "metrics": {
@@ -979,6 +979,7 @@ async def root() -> dict[str, Any]:
         "model_calibrated": False, "model_validation_status": MODEL_VALIDATION_STATUS,
         "api_key_configured": bool(API_KEY),
         "purpose": "sports_evidence_not_betting_advice",
+        "foundation": {"founder": "Sebastián Betancourt"},
     }
 
 
@@ -1001,6 +1002,7 @@ async def meta() -> dict[str, Any]:
         "calibration_status": latest.get("status") if latest else MODEL_VALIDATION_STATUS,
         "calibration_run_id": latest.get("run_id") if latest else None,
         "viability_status": "NOT_CERTIFIED", "timezone": "America/Bogota",
+        "foundation": {"founder": "Sebastián Betancourt"},
         "rate_policy": {"configured_per_minute": REQUESTS_PER_MINUTE, "hard_maximum": 420, "pacing": "uniform"},
         "disclaimer": "Análisis estadístico deportivo; no constituye recomendación de apuesta.",
     }

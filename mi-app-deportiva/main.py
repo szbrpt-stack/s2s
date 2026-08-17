@@ -36,9 +36,9 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "7.0.0"
-CONTRACT_VERSION = "7.0"
-MODEL_VERSION = "hierarchical-dc-v7-evidence-lineage"
+ENGINE_VERSION = "7.2.0"
+CONTRACT_VERSION = "7.2"
+MODEL_VERSION = "hierarchical-dc-v7.2-boundary-audited-lineage"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
@@ -80,6 +80,7 @@ _memory_cache: dict[str, tuple[float, Any]] = {}
 _catalog: list[dict[str, Any]] = []
 _catalog_date: str | None = None
 _catalog_loaded_monotonic = 0.0
+_catalog_discovery: dict[str, Any] = {}
 _analysis_task: asyncio.Task[None] | None = None
 _analysis_errors: dict[str, str] = {}
 _progress = {"phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0, "overall_total": 1.0, "started_at": None}
@@ -187,6 +188,10 @@ def init_db() -> None:
                 done INTEGER NOT NULL, total INTEGER NOT NULL, payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS coverage_manifests (
+                id BIGSERIAL PRIMARY KEY, fixture_date TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL
+            )""")
         log.info("Persistencia PostgreSQL inicializada")
         return
     path = Path(STATE_DB_PATH)
@@ -234,7 +239,48 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             )"""
         )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS coverage_manifests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_date TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL
+            )"""
+        )
         db.commit()
+
+
+def db_save_coverage_manifest(payload: dict[str, Any]) -> None:
+    values = (
+        str(payload.get("date") or ""),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        datetime.now(UTC).isoformat(),
+    )
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            db.execute("INSERT INTO coverage_manifests(fixture_date,payload,created_at) VALUES(%s,%s,%s)", values)
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            db.execute("INSERT INTO coverage_manifests(fixture_date,payload,created_at) VALUES(?,?,?)", values)
+            db.commit()
+
+
+def db_coverage_history(limit: int = 14) -> list[dict[str, Any]]:
+    query = (
+        "SELECT payload FROM coverage_manifests ORDER BY id DESC LIMIT %s"
+        if DATABASE_URL else "SELECT payload FROM coverage_manifests ORDER BY id DESC LIMIT ?"
+    )
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            rows = db.execute(query, (limit,)).fetchall()
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            rows = db.execute(query, (limit,)).fetchall()
+    result = []
+    for row in rows:
+        try:
+            result.append(json.loads(row[0]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return result
 
 
 def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
@@ -634,6 +680,52 @@ async def provider_get(
     raise RuntimeError(last_error)
 
 
+async def discover_daily_catalog(client: httpx.AsyncClient, fixture_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reconcile adjacent provider dates against the requested Bogotá day."""
+    requested = datetime.strptime(fixture_date, "%Y-%m-%d").date()
+    source_dates = [(requested + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)]
+    responses = await asyncio.gather(*(
+        provider_get(client, "/fixtures", {"date": source_date, "timezone": "America/Bogota"})
+        for source_date in source_dates
+    ))
+    source_counts: dict[str, int] = {}
+    unique: dict[str, dict[str, Any]] = {}
+    duplicate_hits = 0
+    invalid_rows = 0
+    for source_date, response in zip(source_dates, responses):
+        rows = response if isinstance(response, list) else []
+        source_counts[source_date] = len(rows)
+        for row in rows:
+            info = (row.get("fixture") or {}) if isinstance(row, dict) else {}
+            fixture_id = str(info.get("id") or "")
+            kickoff = parse_dt(info.get("date"))
+            if not fixture_id or not kickoff:
+                invalid_rows += 1
+                continue
+            if fixture_id in unique:
+                duplicate_hits += 1
+            unique[fixture_id] = row
+    selected = [
+        row for row in unique.values()
+        if parse_dt((row.get("fixture") or {}).get("date")).astimezone(BOGOTA).date() == requested
+    ]
+    selected.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp())
+    audit = {
+        "strategy": "ADJACENT_DATES_RECONCILED_BY_FIXTURE_ID_AND_BOGOTA_KICKOFF",
+        "requested_local_date": fixture_date,
+        "source_dates": source_dates,
+        "source_counts": source_counts,
+        "raw_rows": sum(source_counts.values()),
+        "unique_fixture_ids": len(unique),
+        "duplicate_hits": duplicate_hits,
+        "invalid_rows": invalid_rows,
+        "outside_requested_local_date": len(unique) - len(selected),
+        "selected": len(selected),
+    }
+    log.info("Descubrimiento reconciliado: %s", audit)
+    return selected, audit
+
+
 LIVE_CODES = {"1H", "HT", "2H", "ET", "BT", "P", "LIVE", "INT"}
 FINISHED_CODES = {"FT", "AET", "PEN"}
 STOPPED_CODES = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP"}
@@ -925,6 +1017,8 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
             if played and played < cutoff:
                 eligible.append(row)
         eligible.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True)
+        current_sample = len(eligible)
+        previous_sample = 0
         evidence_tier = "A_CURRENT_COMPETITION_SEASON"
         if len(eligible) < 10:
             previous_rows = await provider_get(
@@ -936,6 +1030,7 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
                 if played and played < cutoff:
                     previous_eligible.append(row)
             previous_eligible.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True)
+            previous_sample = len(previous_eligible)
             known = {int((row.get("fixture") or {}).get("id") or 0): row for row in (*eligible, *previous_eligible)}
             eligible = sorted(
                 known.values(), key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True,
@@ -946,6 +1041,9 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
         valid = [(h, a) for h, a in valid if h is not None and a is not None]
         result = {
             "sample": len(valid),
+            "current_season_sample": current_sample,
+            "previous_season_sample": previous_sample,
+            "historical_share": round(max(0, len(valid) - current_sample) / len(valid), 4) if valid else 0.0,
             "home_rate": sum(h for h, _ in valid) / len(valid) if valid else None,
             "away_rate": sum(a for _, a in valid) / len(valid) if valid else None,
             "evidence_tier": evidence_tier,
@@ -1132,10 +1230,13 @@ def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[st
     history_score = min(history_n / HISTORY_SIZE, 1.0)
     season_score = min(season_n / 20.0, 1.0)
     league_score = min(int(league.get("sample") or 0) / 60.0, 1.0)
-    lineage_penalty = 8 if any(
+    team_lineage_penalty = 8 if any(
         "CROSS_COMPETITION" in str(tier)
         for tier in (home.get("evidence_tier"), away.get("evidence_tier"))
     ) else 0
+    historical_share = clamp(float(league.get("historical_share") or 0.0), 0.0, 1.0)
+    league_lineage_penalty = round(6 * historical_share)
+    lineage_penalty = team_lineage_penalty + league_lineage_penalty
     score = max(0, round(100 * (0.35 * history_score + 0.35 * season_score + 0.20 * league_score + 0.10 * advanced_ratio)) - lineage_penalty)
     label = "HIGH" if score >= 80 else "MODERATE" if score >= 60 else "LIMITED" if score >= 40 else "INSUFFICIENT"
     return {
@@ -1143,6 +1244,9 @@ def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[st
         "season_matches_min": season_n, "league_matches": int(league.get("sample") or 0),
         "advanced_coverage": round(advanced_ratio, 3),
         "lineage_penalty": lineage_penalty,
+        "team_lineage_penalty": team_lineage_penalty,
+        "league_lineage_penalty": league_lineage_penalty,
+        "league_historical_share": round(historical_share, 4),
         "lineage": {
             "home": home.get("evidence_tier", "UNKNOWN"),
             "away": away.get("evidence_tier", "UNKNOWN"),
@@ -1186,6 +1290,12 @@ def base_shell(fixture: dict[str, Any]) -> dict[str, Any]:
         "expected_goals": None, "marcador_estimado": "—", "scoreline_top": [],
         "evidence_quality": {"score": 0, "label": "INSUFFICIENT"}, "data_quality": 0, "sample_size": 0,
         "confidence": None, "viability": None, "viability_status": "NOT_CERTIFIED",
+        "market_coverage": {
+            "goals": {"status": "UNAVAILABLE", "sample": 0},
+            "corners": {"status": "UNAVAILABLE", "sample": 0},
+            "cards": {"status": "UNAVAILABLE", "sample": 0},
+            "shots": {"status": "UNAVAILABLE", "sample": 0},
+        },
         "abstention_reasons": [], "metrics": {}, "h2h": [],
         "mercado": "ANÁLISIS ESTADÍSTICO", "cr_mercado": "N/D", "cr_score_num": "0",
         "cr_home_casa": "N/D", "cr_away_fora": "N/D", "cr_combinado_split": "N/D", "proyeccion_val": "N/D",
@@ -1201,6 +1311,26 @@ def base_shell(fixture: dict[str, Any]) -> dict[str, Any]:
         "metrics_home": {}, "metrics_away": {}, "_sort": {"LIVE": 0, "UPCOMING": 1, "UNCONFIRMED": 2, "STOPPED": 3, "FINISHED": 4}.get(state["group"], 5),
         "_timestamp": state["timestamp"],
     }
+
+
+def competition_priority(row: dict[str, Any]) -> int:
+    """Presentation priority only; it never removes or changes evidence."""
+    name = f"{row.get('country', '')} {row.get('league_name', '')}".lower()
+    primary = (
+        "champions league", "europa league", "conference league", "world cup",
+        "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
+        "primeira liga", "eredivisie", "liga profesional argentina",
+        "brasileiro serie a", "primera a", "liga mx",
+    )
+    secondary = ("championship", "segunda", "serie b", "2. bundesliga", "coppa italia", "copa del rey", "cup")
+    developmental = ("u17", "u18", "u19", "u20", "u21", "u23", "youth", "reserve", "friendlies")
+    if any(token in name for token in primary):
+        return 0
+    if any(token in name for token in secondary):
+        return 1
+    if any(token in name for token in developmental):
+        return 3
+    return 2
 
 
 async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> dict[str, Any]:
@@ -1319,6 +1449,11 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
             f"n={evidence.get('sample', 0)}|{evidence.get('distribution', 'N/D')}"
         )
 
+    def market_state(evidence: dict[str, Any]) -> dict[str, Any]:
+        sample = int(evidence.get("sample") or 0)
+        status = "SUPPORTED" if evidence.get("available") else "PARTIAL" if sample > 0 else "UNAVAILABLE"
+        return {"status": status, "sample": sample, "validation_status": evidence.get("validation_status")}
+
     snapshot = {
         **shell,
         "analysis_status": "READY", "analysis_message": lineage_note,
@@ -1336,6 +1471,10 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
             "reason": "Evaluado internamente en ventanas cronológicas; no certificado ni promovido",
         },
         "viability": None, "viability_status": "NOT_CERTIFIED",
+        "market_coverage": {
+            "goals": {"status": "SUPPORTED", "sample": len(goal_hist), "validation_status": MODEL_VALIDATION_STATUS},
+            "corners": market_state(corners), "cards": market_state(cards), "shots": market_state(shots),
+        },
         "metrics": {
             "goals_2_5": {"available": True, "direction": goals_direction, "line": goals_line, "probability": round(goals_probability, 6), "sample": len(home_goal_hist) + len(away_goal_hist)},
             "corners_8_5": corners, "cards_4_5": cards, "shots_20_5": shots,
@@ -1401,7 +1540,9 @@ def merged_props() -> list[dict[str, Any]]:
                 "abstention_reasons": [] if started_during_run else [message],
             }
         rows.append(row)
-    rows.sort(key=lambda row: (row.get("_sort", 9), row.get("_timestamp", 0), row.get("league_name", "")))
+    rows.sort(key=lambda row: (
+        row.get("_sort", 9), competition_priority(row), row.get("_timestamp", 0), row.get("league_name", "")
+    ))
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
 
 
@@ -1423,6 +1564,7 @@ async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> 
     if not candidates:
         _progress.update(phase="COMPLETE", done=1, total=1)
         _progress.update(overall_done=1.0, overall_total=1.0)
+        await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
         return
     timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
     async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
@@ -1480,17 +1622,18 @@ async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> 
     ready = sum(row.get("analysis_status") == "READY" for row in _snapshots.values())
     abstained = sum(row.get("analysis_status") == "ABSTAINED" for row in _snapshots.values())
     log.info("Día procesado: ready=%s abstained=%s errors=%s", ready, abstained, len(_analysis_errors))
+    await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
 
 
 async def load_catalog(fixture_date: str, force: bool = False) -> None:
-    global _catalog, _catalog_date, _catalog_loaded_monotonic, _analysis_task, _snapshots
+    global _catalog, _catalog_date, _catalog_loaded_monotonic, _analysis_task, _snapshots, _catalog_discovery
     async with _catalog_lock:
         fresh = _catalog and _catalog_date == fixture_date and time.monotonic() - _catalog_loaded_monotonic < CATALOG_TTL
         if fresh and not force:
             return
         timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
         async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
-            rows = await provider_get(client, "/fixtures", {"date": fixture_date, "timezone": "America/Bogota"})
+            rows, discovery = await discover_daily_catalog(client, fixture_date)
             if isinstance(rows, list):
                 hydrated = await hydrate_finished_advanced(client, rows)
                 if hydrated:
@@ -1499,6 +1642,7 @@ async def load_catalog(fixture_date: str, force: bool = False) -> None:
             raise RuntimeError("API-Football no devolvió un catálogo válido")
         date_changed = _catalog_date != fixture_date
         _catalog = rows
+        _catalog_discovery = discovery
         _catalog_date = fixture_date
         _catalog_loaded_monotonic = time.monotonic()
         if date_changed:
@@ -1550,6 +1694,7 @@ def coverage_payload() -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION, "date": _catalog_date,
         "provider": "API_FOOTBALL", "timezone": "America/Bogota",
+        "discovery": _catalog_discovery,
         "provider_catalog_count": len(_catalog), "delivered_count": len(props),
         "fixture_id_sha256": hashlib.sha256("|".join(fixture_ids).encode()).hexdigest(),
         "countries": len({row.get("pais") for row in props}), "competitions": len(competitions),
@@ -1727,6 +1872,11 @@ async def coverage(date: str | None = Query(None)) -> dict[str, Any]:
     except Exception as exc:
         log.exception("No se pudo auditar cobertura")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/coverage/history")
+async def coverage_history(limit: int = Query(14, ge=1, le=90)) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(db_coverage_history, limit)
 
 
 @app.get("/api/v1/props")

@@ -28,7 +28,12 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 
-ENGINE_VERSION = "5.1.0"
+try:
+    import psycopg
+except ImportError:  # El desarrollo local puede continuar con SQLite.
+    psycopg = None
+
+ENGINE_VERSION = "5.2.0"
 CONTRACT_VERSION = "5.0"
 MODEL_VERSION = "dc-shrunk-v2-walk-forward-validated"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_VALIDATED_NOT_EXTERNALLY_CERTIFIED"
@@ -54,6 +59,8 @@ DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.05")), 0
 RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.0")), 1.0))
 DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_BACKEND = "postgresql" if DATABASE_URL else "sqlite"
 ADMIN_TOKEN = os.getenv("S2S_ADMIN_TOKEN", "").strip()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -144,6 +151,22 @@ def chunks(values: Iterable[int], size: int = 20) -> list[list[int]]:
 
 
 def init_db() -> None:
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL está configurada pero falta psycopg")
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+                fixture_id TEXT PRIMARY KEY, fixture_date TEXT NOT NULL,
+                cutoff_utc TEXT NOT NULL, model_version TEXT NOT NULL,
+                payload TEXT NOT NULL, created_at TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS calibration_runs (
+                id BIGSERIAL PRIMARY KEY, created_at TEXT NOT NULL,
+                status TEXT NOT NULL, promoted INTEGER NOT NULL DEFAULT 0,
+                payload TEXT NOT NULL
+            )""")
+        log.info("Persistencia PostgreSQL inicializada")
+        return
     path = Path(STATE_DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as db:
@@ -171,10 +194,16 @@ def init_db() -> None:
 
 
 def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
-    with sqlite3.connect(STATE_DB_PATH) as db:
-        rows = db.execute(
-            "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=?", (fixture_date,)
-        ).fetchall()
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            rows = db.execute(
+                "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=%s", (fixture_date,)
+            ).fetchall()
+    else:
+        with sqlite3.connect(STATE_DB_PATH) as db:
+            rows = db.execute(
+                "SELECT fixture_id, payload FROM snapshots WHERE fixture_date=?", (fixture_date,)
+            ).fetchall()
     result: dict[str, dict[str, Any]] = {}
     for fixture_id, payload in rows:
         try:
@@ -185,33 +214,31 @@ def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
 
 
 def db_save_snapshot(fixture_date: str, fixture_id: str, cutoff: str, payload: dict[str, Any]) -> None:
-    with sqlite3.connect(STATE_DB_PATH) as db:
-        db.execute(
-            """INSERT INTO snapshots(fixture_id, fixture_date, cutoff_utc, model_version, payload, created_at)
-               VALUES(?,?,?,?,?,?)
-               ON CONFLICT(fixture_id) DO UPDATE SET
-                 fixture_date=excluded.fixture_date,
-                 cutoff_utc=excluded.cutoff_utc,
-                 model_version=excluded.model_version,
-                 payload=excluded.payload,
-                 created_at=excluded.created_at""",
-            (
-                fixture_id,
-                fixture_date,
-                cutoff,
-                MODEL_VERSION,
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        db.commit()
+    values = (fixture_id, fixture_date, cutoff, MODEL_VERSION,
+              json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+              datetime.now(UTC).isoformat())
+    statement = """INSERT INTO snapshots(fixture_id, fixture_date, cutoff_utc, model_version, payload, created_at)
+       VALUES({placeholders}) ON CONFLICT(fixture_id) DO UPDATE SET
+       fixture_date=excluded.fixture_date, cutoff_utc=excluded.cutoff_utc,
+       model_version=excluded.model_version, payload=excluded.payload,
+       created_at=excluded.created_at"""
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            db.execute(statement.format(placeholders="%s,%s,%s,%s,%s,%s"), values)
+    else:
+        with sqlite3.connect(STATE_DB_PATH) as db:
+            db.execute(statement.format(placeholders="?,?,?,?,?,?"), values)
+            db.commit()
 
 
 def db_latest_calibration() -> dict[str, Any] | None:
-    with sqlite3.connect(STATE_DB_PATH) as db:
-        row = db.execute(
-            "SELECT id, created_at, status, promoted, payload FROM calibration_runs ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+    query = "SELECT id, created_at, status, promoted, payload FROM calibration_runs ORDER BY id DESC LIMIT 1"
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            row = db.execute(query).fetchone()
+    else:
+        with sqlite3.connect(STATE_DB_PATH) as db:
+            row = db.execute(query).fetchone()
     if not row:
         return None
     try:
@@ -219,6 +246,25 @@ def db_latest_calibration() -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return {"run_id": row[0], "created_at": row[1], "status": "CORRUPT", "promoted": False}
     return {**payload, "run_id": row[0], "created_at": row[1], "status": row[2], "promoted": bool(row[3])}
+
+
+def db_save_calibration(report: dict[str, Any]) -> int:
+    created_at = datetime.now(UTC).isoformat()
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            row = db.execute(
+                "INSERT INTO calibration_runs(created_at,status,promoted,payload) VALUES(%s,%s,0,%s) RETURNING id",
+                (created_at, report["status"], payload),
+            ).fetchone()
+            return int(row[0])
+    with sqlite3.connect(STATE_DB_PATH) as db:
+        cursor = db.execute(
+            "INSERT INTO calibration_runs(created_at,status,promoted,payload) VALUES(?,?,0,?)",
+            (created_at, report["status"], payload),
+        )
+        db.commit()
+        return int(cursor.lastrowid)
 
 
 init_db()
@@ -1039,7 +1085,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok", "catalog_date": _catalog_date, "catalog_matches": len(_catalog),
         "analysis_running": bool(_analysis_task and not _analysis_task.done()), "quota": _quota,
-        "database": STATE_DB_PATH, "snapshots_loaded": len(_snapshots),
+        "database": DATABASE_BACKEND, "database_persistent": bool(DATABASE_URL), "snapshots_loaded": len(_snapshots),
     }
 
 

@@ -36,7 +36,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "7.2.0"
+ENGINE_VERSION = "7.2.1"
 CONTRACT_VERSION = "7.2"
 MODEL_VERSION = "hierarchical-dc-v7.2-boundary-audited-lineage"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
@@ -1546,6 +1546,17 @@ def merged_props() -> list[dict[str, Any]]:
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
 
 
+def stamp_snapshot(result: dict[str, Any]) -> dict[str, Any]:
+    """Version every durable decision, including a scientifically valid abstention."""
+    if result.get("analysis_status") not in {"READY", "ABSTAINED"}:
+        return result
+    return {
+        **result,
+        "model_version": MODEL_VERSION,
+        "snapshot_cutoff_utc": result.get("snapshot_cutoff_utc") or datetime.now(UTC).isoformat(),
+    }
+
+
 async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> None:
     global _snapshots
     candidates = []
@@ -1603,7 +1614,7 @@ async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> 
                 shell = base_shell(fixture)
                 fixture_id = shell["fixture_id"]
                 try:
-                    result = await build_analysis(client, fixture)
+                    result = stamp_snapshot(await build_analysis(client, fixture))
                     if result["analysis_status"] in {"READY", "ABSTAINED"}:
                         _snapshots[fixture_id] = result
                         await asyncio.to_thread(db_save_snapshot, fixture_date, fixture_id, result.get("snapshot_cutoff_utc") or datetime.now(UTC).isoformat(), result)

@@ -37,7 +37,7 @@ except ImportError:  # El desarrollo local puede continuar con SQLite.
 
 ENGINE_VERSION = "6.0.0"
 CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v3-league-coherent-evaluation"
+MODEL_VERSION = "dc-shrunk-v4-league-coherent-advanced-intervals"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")

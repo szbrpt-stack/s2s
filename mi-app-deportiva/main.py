@@ -30,7 +30,8 @@ from fastapi import FastAPI, Header, HTTPException, Query
 
 ENGINE_VERSION = "5.0.0"
 CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v1-uncalibrated"
+MODEL_VERSION = "dc-shrunk-v2-backtest-candidate"
+MODEL_VALIDATION_STATUS = "BACKTEST_CANDIDATE_NOT_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 UTC = timezone.utc
@@ -48,8 +49,9 @@ HISTORY_SIZE = max(5, min(int(os.getenv("HISTORY_SIZE", "10")), 20))
 MIN_HISTORY = max(3, min(int(os.getenv("MIN_HISTORY", "5")), HISTORY_SIZE))
 MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
 STALE_NS_MINUTES = max(90, int(os.getenv("STALE_NS_MINUTES", "180")))
-SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "6")))
-DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.08")), 0.05))
+SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "12")))
+DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.05")), 0.05))
+RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.0")), 1.0))
 DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
 ADMIN_TOKEN = os.getenv("S2S_ADMIN_TOKEN", "").strip()
@@ -700,8 +702,8 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
     recent_a = recent_rate(away["matches"], "gf")
     recency_h = clamp((recent_h / max(home["gf_total"] or base_h, 0.2)) if recent_h is not None else 1.0, 0.85, 1.15)
     recency_a = clamp((recent_a / max(away["gf_total"] or base_a, 0.2)) if recent_a is not None else 1.0, 0.85, 1.15)
-    lambda_home = clamp(base_h * home_attack * away_defence * recency_h, 0.15, 4.5)
-    lambda_away = clamp(base_a * away_attack * home_defence * recency_a, 0.15, 4.5)
+    lambda_home = clamp(base_h * home_attack * away_defence * (recency_h**RECENCY_STRENGTH), 0.15, 4.5)
+    lambda_away = clamp(base_a * away_attack * home_defence * (recency_a**RECENCY_STRENGTH), 0.15, 4.5)
     matrix = score_matrix(lambda_home, lambda_away)
     p_home = sum(matrix[h][a] for h in range(len(matrix)) for a in range(len(matrix[h])) if h > a)
     p_draw = sum(matrix[n][n] for n in range(len(matrix)))
@@ -751,7 +753,10 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "scoreline_top": [{"score": f"{h} - {a}", "probability": round(prob, 6)} for prob, h, a in top],
         "evidence_quality": quality, "data_quality": quality["score"],
         "sample_size": len(home["matches"]) + len(away["matches"]),
-        "confidence": {"status": "UNCALIBRATED", "reason": "Pendiente de backtesting y calibración externa"},
+        "confidence": {
+            "status": MODEL_VALIDATION_STATUS,
+            "reason": "Candidato mejora holdout 1X2; pendiente de validación multiventana y certificación externa",
+        },
         "viability": None, "viability_status": "NOT_CERTIFIED",
         "metrics": {
             "goals_2_5": {"available": True, "direction": goals_direction, "line": goals_line, "probability": round(goals_probability, 6), "sample": len(home_goal_hist) + len(away_goal_hist)},
@@ -971,7 +976,8 @@ async def root() -> dict[str, Any]:
     return {
         "status": "ok", "service": "S2S Sigma Engine", "version": ENGINE_VERSION,
         "contract_version": CONTRACT_VERSION, "model_version": MODEL_VERSION,
-        "model_calibrated": False, "api_key_configured": bool(API_KEY),
+        "model_calibrated": False, "model_validation_status": MODEL_VALIDATION_STATUS,
+        "api_key_configured": bool(API_KEY),
         "purpose": "sports_evidence_not_betting_advice",
     }
 
@@ -991,7 +997,8 @@ async def meta() -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION, "engine_version": ENGINE_VERSION,
         "model_version": MODEL_VERSION,
-        "calibration_status": latest.get("status") if latest else "NOT_CALIBRATED",
+        "model_parameters": {"rho": DIXON_COLES_RHO, "shrinkage": SHRINKAGE_MATCHES, "recency_strength": RECENCY_STRENGTH},
+        "calibration_status": latest.get("status") if latest else MODEL_VALIDATION_STATUS,
         "calibration_run_id": latest.get("run_id") if latest else None,
         "viability_status": "NOT_CERTIFIED", "timezone": "America/Bogota",
         "rate_policy": {"configured_per_minute": REQUESTS_PER_MINUTE, "hard_maximum": 420, "pacing": "uniform"},

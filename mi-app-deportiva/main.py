@@ -35,7 +35,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "5.6.0"
+ENGINE_VERSION = "6.0.0"
 CONTRACT_VERSION = "5.0"
 MODEL_VERSION = "dc-shrunk-v3-league-coherent-evaluation"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_NOT_EXTERNALLY_CERTIFIED"
@@ -394,6 +394,8 @@ def db_save_advanced_stats(rows: dict[int, dict[str, Any]]) -> None:
 
 def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict[str, Any]]) -> int:
     values = []
+    finished_ids = [int(base_shell(row)["fixture_id"]) for row in catalog if base_shell(row)["is_finished"]]
+    advanced_actuals = db_load_advanced_stats(finished_ids)
     for fixture in catalog:
         shell = base_shell(fixture)
         snapshot = snapshots.get(shell["fixture_id"])
@@ -435,6 +437,22 @@ def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict
             "baseline_brier_over25": round((0.5 - (1.0 if actual_home + actual_away >= 3 else 0.0)) ** 2, 8),
             "actual_1x2": actual,
         }
+        advanced_payload = advanced_actuals.get(int(shell["fixture_id"])) or {}
+        team_blocks = advanced_payload.get("teams") if "teams" in advanced_payload else advanced_payload
+        for metric_name, snapshot_key in (("corners", "corners_8_5"), ("cards", "cards_4_5"), ("shots", "shots_20_5")):
+            evidence = ((snapshot.get("metrics") or {}).get(snapshot_key) or {})
+            observed_values = [as_float(block.get(metric_name)) for block in (team_blocks or {}).values() if isinstance(block, dict)]
+            observed_values = [item for item in observed_values if item is not None]
+            observed_total = sum(observed_values) if observed_values else None
+            probability_over = as_float(evidence.get("probability_over"))
+            projection = as_float(evidence.get("projection"))
+            line = as_float(evidence.get("line"))
+            metrics[f"{metric_name}_actual"] = observed_total
+            metrics[f"{metric_name}_mae"] = round(abs(projection - observed_total), 8) if projection is not None and observed_total is not None else None
+            metrics[f"{metric_name}_brier"] = (
+                round((probability_over - float(observed_total > line)) ** 2, 8)
+                if probability_over is not None and observed_total is not None and line is not None else None
+            )
         values.append((
             shell["fixture_id"], shell.get("kickoff_utc"), snapshot.get("model_version") or MODEL_VERSION,
             json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), actual_home, actual_away,
@@ -448,13 +466,17 @@ def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict
                 cursor.executemany(
                     """INSERT INTO prediction_outcomes
                        (fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(fixture_id) DO NOTHING""", values)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(fixture_id) DO UPDATE SET
+                       actual_home=excluded.actual_home,actual_away=excluded.actual_away,
+                       metrics=excluded.metrics,resolved_at=excluded.resolved_at""", values)
     else:
         with closing(sqlite3.connect(STATE_DB_PATH)) as db:
             db.executemany(
                 """INSERT INTO prediction_outcomes
                    (fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at)
-                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fixture_id) DO NOTHING""", values)
+                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fixture_id) DO UPDATE SET
+                   actual_home=excluded.actual_home,actual_away=excluded.actual_away,
+                   metrics=excluded.metrics,resolved_at=excluded.resolved_at""", values)
             db.commit()
     return len(values)
 
@@ -487,6 +509,15 @@ def db_model_scorecard() -> dict[str, Any]:
         baseline_brier = average("baseline_brier_1x2")
         over_brier = average("brier_over25")
         baseline_over = average("baseline_brier_over25")
+        advanced = {}
+        for field in ("corners", "cards", "shots"):
+            advanced_n = sum(row.get(f"{field}_brier") is not None for row in metric_rows)
+            field_brier = average(f"{field}_brier")
+            advanced[field] = {
+                "n": advanced_n, "brier": field_brier, "mae": average(f"{field}_mae"),
+                "baseline_brier": 0.25 if advanced_n else None,
+                "brier_improvement_pct": round((0.25 - field_brier) / 0.25 * 100, 4) if field_brier is not None else None,
+            }
         return {
             "n": n,
             "log_loss_1x2": average("log_loss_1x2"), "brier_1x2": brier,
@@ -494,6 +525,7 @@ def db_model_scorecard() -> dict[str, Any]:
             "baseline_brier_1x2": baseline_brier, "baseline_brier_over25": baseline_over,
             "brier_improvement_pct": round((baseline_brier - brier) / baseline_brier * 100, 4) if brier is not None and baseline_brier else None,
             "over25_brier_improvement_pct": round((baseline_over - over_brier) / baseline_over * 100, 4) if over_brier is not None and baseline_over else None,
+            "advanced": advanced,
         }
 
     def calibration_bins(selected: list[dict[str, Any]], market: str) -> list[dict[str, Any]]:
@@ -533,9 +565,14 @@ def db_model_scorecard() -> dict[str, Any]:
                 "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
         "goals_2_5": {"eligible": n >= 300 and (overall.get("over25_brier_improvement_pct") or -999) > 0,
                       "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
-        "corners": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
-        "cards": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
-        "shots": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
+        **{
+            field: {
+                "eligible": overall["advanced"][field]["n"] >= 100 and (overall["advanced"][field].get("brier_improvement_pct") or -999) > 0,
+                "requirements": {"minimum_n": 100, "positive_brier_improvement": True},
+                "current": overall["advanced"][field],
+            }
+            for field in ("corners", "cards", "shots")
+        },
     }
     return {
         "status": "PRELIMINARY" if n < 100 else "MONITORED",
@@ -667,13 +704,47 @@ def stat_map(block: dict[str, Any]) -> dict[str, float | None]:
     }
 
 
+def fixture_advanced_blocks(row: dict[str, Any]) -> dict[int, dict[str, float | None]]:
+    return {
+        int(block.get("team", {}).get("id")): stat_map(block)
+        for block in row.get("statistics") or [] if block.get("team", {}).get("id")
+    }
+
+
+async def hydrate_finished_advanced(client: httpx.AsyncClient, catalog: list[dict[str, Any]]) -> int:
+    finished_ids = {
+        int((row.get("fixture") or {}).get("id") or 0)
+        for row in catalog
+        if fixture_state(row.get("fixture") or {})["is_finished"]
+    }
+    finished_ids.discard(0)
+    stored = await asyncio.to_thread(db_load_advanced_stats, list(finished_ids))
+    missing = sorted(finished_ids - set(stored))
+    fetched: dict[int, dict[str, Any]] = {}
+    for batch in chunks(missing, 20):
+        rows = await provider_get(client, "/fixtures", {"ids": "-".join(map(str, batch))})
+        for row in rows if isinstance(rows, list) else []:
+            fixture_id = int((row.get("fixture") or {}).get("id") or 0)
+            blocks = fixture_advanced_blocks(row)
+            if fixture_id and blocks:
+                fetched[fixture_id] = blocks
+    await asyncio.to_thread(db_save_advanced_stats, fetched)
+    return len(fetched)
+
+
 async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int], overall_weight: float = 0.0) -> None:
+    stored = await asyncio.to_thread(db_load_advanced_stats, list(fixture_ids))
+    for fixture_id, payload in stored.items():
+        blocks = payload.get("teams") if isinstance(payload, dict) and "teams" in payload else payload
+        cache_put(f"fixture-stats:{fixture_id}", blocks or {}, FIXTURE_STATS_TTL)
     missing = sorted(fid for fid in fixture_ids if cache_get(f"fixture-stats:{fid}") is None)
     batches = chunks(missing, 20)
     if not batches:
         return
     _progress.update(phase="HISTORICAL_STATS", done=0, total=len(batches))
     batch_weight = overall_weight / len(batches)
+
+    fetched: dict[int, dict[str, Any]] = {}
 
     async def load(batch: list[int]) -> None:
         try:
@@ -684,11 +755,9 @@ async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int]
                 if not fixture_id:
                     continue
                 found.add(fixture_id)
-                parsed = {
-                    int(block.get("team", {}).get("id")): stat_map(block)
-                    for block in row.get("statistics") or [] if block.get("team", {}).get("id")
-                }
+                parsed = fixture_advanced_blocks(row)
                 cache_put(f"fixture-stats:{fixture_id}", parsed, FIXTURE_STATS_TTL)
+                fetched[fixture_id] = parsed
             for fixture_id in set(batch) - found:
                 cache_put(f"fixture-stats:{fixture_id}", {}, FIXTURE_STATS_TTL)
         finally:
@@ -699,6 +768,7 @@ async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int]
     for result in results:
         if isinstance(result, Exception):
             log.warning("Lote de estadísticas no disponible: %s", result)
+    await asyncio.to_thread(db_save_advanced_stats, fetched)
 
 
 def parse_match(row: dict[str, Any], team_id: int) -> dict[str, Any] | None:
@@ -965,6 +1035,14 @@ def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metr
         return clamp(total, 0.0, 1.0)
 
     over_probability = 1.0 - probability_at_most(math.floor(line))
+
+    def quantile(target: float) -> int:
+        for count in range(0, 101):
+            if probability_at_most(count) >= target:
+                return count
+        return 100
+
+    interval_80 = {"low": quantile(0.10), "high": quantile(0.90), "coverage": 0.80}
     direction = "OVER" if over_probability >= 0.5 else "UNDER"
     frequency = over_probability if direction == "OVER" else 1 - over_probability
     return {
@@ -974,7 +1052,9 @@ def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metr
         "expected_home": round(expected_home, 3), "expected_away": round(expected_away, 3),
         "distribution": "NEGATIVE_BINOMIAL" if dispersion is not None else "POISSON",
         "dispersion": round(dispersion, 4) if dispersion is not None else None,
-        "validation_status": "EXPERIMENTAL_NOT_WALK_FORWARD_VALIDATED",
+        "interval_80": interval_80,
+        "validation_status": "EVALUATED_NOT_PROMOTED",
+        "publication_status": "EXPERIMENTAL",
         "home_frequency": round(sum((v > line) if direction == "OVER" else (v < line) for v in home_values) / len(home_values), 4),
         "away_frequency": round(sum((v > line) if direction == "OVER" else (v < line) for v in away_values) / len(away_values), 4),
         "sample": len(combined),
@@ -1149,6 +1229,16 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         values = [float(row[field]) for row in rows if row.get(field) is not None]
         return round(sum(values) / len(values), 2) if values else 0.0
 
+    def advanced_projection(evidence: dict[str, Any]) -> str:
+        if not evidence.get("available"):
+            return "N/D"
+        interval = evidence.get("interval_80") or {}
+        return (
+            f"{evidence.get('projection', 'N/D')}|"
+            f"{interval.get('low', 'N/D')}–{interval.get('high', 'N/D')}|"
+            f"n={evidence.get('sample', 0)}|{evidence.get('distribution', 'N/D')}"
+        )
+
     snapshot = {
         **shell,
         "analysis_status": "READY", "analysis_message": "Estimación preliminar disponible",
@@ -1185,9 +1275,9 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         # El cliente v4 interpreta `cumple=false` como evidencia negativa. No
         # degradamos el H2H rico de v5 a ese contrato semánticamente incorrecto.
         "h2h_matches": [],
-        "corners_label": metric_label("CÓRNERS", corners), "corners_conf": round(corners.get("frequency", 0) * 100), "corners_proyeccion": str(corners.get("projection", "N/D")),
-        "tarjetas_label": metric_label("TARJETAS", cards), "tarjetas_conf": round(cards.get("frequency", 0) * 100), "tarjetas_proyeccion": str(cards.get("projection", "N/D")),
-        "disparos_label": metric_label("REMATES", shots), "disparos_conf": round(shots.get("frequency", 0) * 100), "disparos_proyeccion": str(shots.get("projection", "N/D")),
+        "corners_label": metric_label("CÓRNERS", corners), "corners_conf": round(corners.get("frequency", 0) * 100), "corners_proyeccion": advanced_projection(corners),
+        "tarjetas_label": metric_label("TARJETAS", cards), "tarjetas_conf": round(cards.get("frequency", 0) * 100), "tarjetas_proyeccion": advanced_projection(cards),
+        "disparos_label": metric_label("REMATES", shots), "disparos_conf": round(shots.get("frequency", 0) * 100), "disparos_proyeccion": advanced_projection(shots),
         "btts_conf": round(btts * 100), "btts_proyeccion": f"{lambda_home:.2f} - {lambda_away:.2f}",
         "cr_home_l10": "N/D", "cr_away_l10": "N/D", "cr_combinado_l10": "N/D",
         "metrics_home": {
@@ -1321,6 +1411,10 @@ async def load_catalog(fixture_date: str, force: bool = False) -> None:
         timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
         async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
             rows = await provider_get(client, "/fixtures", {"date": fixture_date, "timezone": "America/Bogota"})
+            if isinstance(rows, list):
+                hydrated = await hydrate_finished_advanced(client, rows)
+                if hydrated:
+                    log.info("Warehouse avanzado: %s fixtures finales incorporados", hydrated)
         if not isinstance(rows, list):
             raise RuntimeError("API-Football no devolvió un catálogo válido")
         date_changed = _catalog_date != fixture_date

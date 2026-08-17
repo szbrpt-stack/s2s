@@ -15,7 +15,6 @@ import asyncio
 import json
 import math
 import os
-import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -493,20 +492,7 @@ def advanced_report(points: list[BacktestPoint], stats: dict[int, dict[str, Any]
 
 
 def save_report(report: dict[str, Any]) -> int:
-    with sqlite3.connect(main.STATE_DB_PATH) as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS calibration_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL,
-            promoted INTEGER NOT NULL DEFAULT 0,
-            payload TEXT NOT NULL
-        )""")
-        cursor = db.execute(
-            "INSERT INTO calibration_runs(created_at,status,promoted,payload) VALUES(?,?,0,?)",
-            (datetime.now(main.UTC).isoformat(), report["status"], json.dumps(report, ensure_ascii=False, separators=(",", ":"))),
-        )
-        db.commit()
-        return int(cursor.lastrowid)
+    return main.db_save_calibration(report)
 
 
 async def fetch_rows(client: httpx.AsyncClient, league_id: int, season: int) -> list[dict[str, Any]]:

@@ -1,4 +1,4 @@
-"""S2S Sigma Engine v5.
+"""S2S Sigma Engine v7.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -13,6 +13,7 @@ viability. Until an external backtest calibrates the model, viability is null.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -35,10 +36,10 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "6.0.0"
-CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v4-league-coherent-advanced-intervals"
-MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_NOT_EXTERNALLY_CERTIFIED"
+ENGINE_VERSION = "7.0.0"
+CONTRACT_VERSION = "7.0"
+MODEL_VERSION = "hierarchical-dc-v7-evidence-lineage"
+MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 UTC = timezone.utc
@@ -58,9 +59,10 @@ MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
 MIN_EVIDENCE_QUALITY = max(0, min(int(os.getenv("MIN_EVIDENCE_QUALITY", "55")), 100))
 MAX_GOALS_HISTORY_GAP = max(0.10, min(float(os.getenv("MAX_GOALS_HISTORY_GAP", "0.30")), 0.50))
 STALE_NS_MINUTES = max(5, int(os.getenv("STALE_NS_MINUTES", "15")))
-SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "12")))
-DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.05")), 0.05))
-RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.0")), 1.0))
+SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "8")))
+DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "0.0")), 0.05))
+RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.2")), 1.0))
+ADVANCED_SHRINKAGE = {"corners": 12.0, "cards": 6.0, "shots": 12.0}
 DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -803,6 +805,30 @@ def season_average(stats: dict[str, Any], side: str, venue: str, fallback: float
     return as_float(average.get(venue), fallback)
 
 
+def mean_or_none(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def empirical_profile(matches: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derives transparent fallback rates from official pre-kickoff fixtures."""
+    home = [row for row in matches if row["venue"] == "HOME"]
+    away = [row for row in matches if row["venue"] == "AWAY"]
+    all_gf = [float(row["gf"]) for row in matches]
+    all_gc = [float(row["gc"]) for row in matches]
+    gf_total, gc_total = mean_or_none(all_gf), mean_or_none(all_gc)
+
+    def venue_average(rows: list[dict[str, Any]], field: str, fallback: float | None) -> float | None:
+        observed = mean_or_none([float(row[field]) for row in rows])
+        return observed if observed is not None else fallback
+
+    return {
+        "played_total": len(matches), "played_home": len(home), "played_away": len(away),
+        "gf_total": gf_total, "gc_total": gc_total,
+        "gf_home": venue_average(home, "gf", gf_total), "gc_home": venue_average(home, "gc", gc_total),
+        "gf_away": venue_average(away, "gf", gf_total), "gc_away": venue_average(away, "gc", gc_total),
+    }
+
+
 async def team_profile(
     client: httpx.AsyncClient,
     team_id: int,
@@ -833,26 +859,47 @@ async def team_profile(
         )
         fixtures, season_stats = await asyncio.gather(fixtures_task, stats_task)
         season_stats = season_stats if isinstance(season_stats, dict) else {}
-        matches = [
+        primary_matches = [
             parsed
-            for row in fixtures
+            for row in (fixtures if isinstance(fixtures, list) else [])
             if fixture_state((row.get("fixture") or {}))["group"] == "FINISHED"
             and (parsed := parse_match(row, team_id))
         ]
-        matches = sorted((m for m in matches if m["timestamp"] < cutoff.timestamp()), key=lambda m: m["timestamp"], reverse=True)
+        primary_matches = sorted(
+            (m for m in primary_matches if m["timestamp"] < cutoff.timestamp()),
+            key=lambda m: m["timestamp"], reverse=True,
+        )
+        evidence_tier = "A_SAME_COMPETITION_CURRENT_SEASON"
+        matches = primary_matches[:HISTORY_SIZE]
+        if len(matches) < MIN_HISTORY:
+            fallback_rows = await provider_get(
+                client, "/fixtures", {"team": team_id, "last": min(HISTORY_SIZE * 4, 40)},
+            )
+            fallback_matches = [
+                parsed for row in (fallback_rows if isinstance(fallback_rows, list) else [])
+                if fixture_state((row.get("fixture") or {}))["group"] == "FINISHED"
+                and (parsed := parse_match(row, team_id))
+                and parsed["timestamp"] < cutoff.timestamp()
+            ]
+            combined = {row["fixture_id"]: row for row in (*primary_matches, *fallback_matches)}
+            matches = sorted(combined.values(), key=lambda row: row["timestamp"], reverse=True)[:HISTORY_SIZE]
+            evidence_tier = "B_RECENT_OFFICIAL_CROSS_COMPETITION"
         played_block = (season_stats.get("fixtures") or {}).get("played") or {}
+        empirical = empirical_profile(matches)
+        current_played = int(as_float(played_block.get("total"), 0.0) or 0)
+        use_season_rates = current_played >= MIN_SEASON_PLAYED
         result = {
             "team_id": team_id,
-            "matches": matches[:HISTORY_SIZE],
-            "played_total": int(as_float(played_block.get("total"), 0.0) or 0),
-            "played_home": int(as_float(played_block.get("home"), 0.0) or 0),
-            "played_away": int(as_float(played_block.get("away"), 0.0) or 0),
-            "gf_total": season_average(season_stats, "for", "total"),
-            "gc_total": season_average(season_stats, "against", "total"),
-            "gf_home": season_average(season_stats, "for", "home"),
-            "gc_home": season_average(season_stats, "against", "home"),
-            "gf_away": season_average(season_stats, "for", "away"),
-            "gc_away": season_average(season_stats, "against", "away"),
+            "matches": matches, "evidence_tier": evidence_tier,
+            "played_total": current_played if use_season_rates else empirical["played_total"],
+            "played_home": int(as_float(played_block.get("home"), 0.0) or 0) if use_season_rates else empirical["played_home"],
+            "played_away": int(as_float(played_block.get("away"), 0.0) or 0) if use_season_rates else empirical["played_away"],
+            "gf_total": season_average(season_stats, "for", "total") if use_season_rates else empirical["gf_total"],
+            "gc_total": season_average(season_stats, "against", "total") if use_season_rates else empirical["gc_total"],
+            "gf_home": season_average(season_stats, "for", "home") if use_season_rates else empirical["gf_home"],
+            "gc_home": season_average(season_stats, "against", "home") if use_season_rates else empirical["gc_home"],
+            "gf_away": season_average(season_stats, "for", "away") if use_season_rates else empirical["gf_away"],
+            "gc_away": season_average(season_stats, "against", "away") if use_season_rates else empirical["gc_away"],
         }
         return cache_put(key, result, TEAM_TTL)
 
@@ -878,6 +925,22 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
             if played and played < cutoff:
                 eligible.append(row)
         eligible.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True)
+        evidence_tier = "A_CURRENT_COMPETITION_SEASON"
+        if len(eligible) < 10:
+            previous_rows = await provider_get(
+                client, "/fixtures", {"league": league_id, "season": season - 1, "status": "FT"},
+            )
+            previous_eligible = []
+            for row in previous_rows if isinstance(previous_rows, list) else []:
+                played = parse_dt((row.get("fixture") or {}).get("date")) if isinstance(row, dict) else None
+                if played and played < cutoff:
+                    previous_eligible.append(row)
+            previous_eligible.sort(key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True)
+            known = {int((row.get("fixture") or {}).get("id") or 0): row for row in (*eligible, *previous_eligible)}
+            eligible = sorted(
+                known.values(), key=lambda row: parse_dt((row.get("fixture") or {}).get("date")).timestamp(), reverse=True,
+            )
+            evidence_tier = "B_CURRENT_PLUS_PREVIOUS_SEASON"
         scores = [row.get("goals") or {} for row in eligible[:100]]
         valid = [(as_float(s.get("home")), as_float(s.get("away"))) for s in scores]
         valid = [(h, a) for h, a in valid if h is not None and a is not None]
@@ -885,6 +948,7 @@ async def league_profile(client: httpx.AsyncClient, league_id: int, season: int,
             "sample": len(valid),
             "home_rate": sum(h for h, _ in valid) / len(valid) if valid else None,
             "away_rate": sum(a for _, a in valid) / len(valid) if valid else None,
+            "evidence_tier": evidence_tier,
         }
         return cache_put(key, result, LEAGUE_TTL)
 
@@ -1004,7 +1068,8 @@ def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metr
 
     def regularized(values: list[float]) -> float:
         observed = sum(values) / len(values)
-        weight = len(values) / (len(values) + SHRINKAGE_MATCHES)
+        shrinkage = ADVANCED_SHRINKAGE.get(metric, SHRINKAGE_MATCHES)
+        weight = len(values) / (len(values) + shrinkage)
         return weight * observed + (1 - weight) * league_team_prior
 
     # Producción propia y concesión rival se estiman por separado. La muestra
@@ -1067,12 +1132,22 @@ def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[st
     history_score = min(history_n / HISTORY_SIZE, 1.0)
     season_score = min(season_n / 20.0, 1.0)
     league_score = min(int(league.get("sample") or 0) / 60.0, 1.0)
-    score = round(100 * (0.35 * history_score + 0.35 * season_score + 0.20 * league_score + 0.10 * advanced_ratio))
+    lineage_penalty = 8 if any(
+        "CROSS_COMPETITION" in str(tier)
+        for tier in (home.get("evidence_tier"), away.get("evidence_tier"))
+    ) else 0
+    score = max(0, round(100 * (0.35 * history_score + 0.35 * season_score + 0.20 * league_score + 0.10 * advanced_ratio)) - lineage_penalty)
     label = "HIGH" if score >= 80 else "MODERATE" if score >= 60 else "LIMITED" if score >= 40 else "INSUFFICIENT"
     return {
         "score": score, "label": label, "history_per_team": history_n,
         "season_matches_min": season_n, "league_matches": int(league.get("sample") or 0),
         "advanced_coverage": round(advanced_ratio, 3),
+        "lineage_penalty": lineage_penalty,
+        "lineage": {
+            "home": home.get("evidence_tier", "UNKNOWN"),
+            "away": away.get("evidence_tier", "UNKNOWN"),
+            "league": league.get("evidence_tier", "UNKNOWN"),
+        },
     }
 
 
@@ -1214,6 +1289,11 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
                 "sample_size": len(home["matches"]) + len(away["matches"])}
     h2h = await head_to_head(client, shell["home_id"], shell["away_id"], cutoff)
     btts = sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h])))
+    lineage_note = (
+        f"Evidencia oficial multi-competición ajustada; penalización de linaje {quality['lineage_penalty']} puntos"
+        if quality.get("lineage_penalty") else
+        "Evidencia oficial de la misma competición y temporada"
+    )
 
     def metric_label(name: str, evidence: dict[str, Any]) -> str:
         if not evidence["available"]:
@@ -1241,7 +1321,7 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
 
     snapshot = {
         **shell,
-        "analysis_status": "READY", "analysis_message": "Estimación preliminar disponible",
+        "analysis_status": "READY", "analysis_message": lineage_note,
         "status_verdict": "ANALISIS_LISTO", "model_version": MODEL_VERSION,
         "model_calibrated": False, "snapshot_cutoff_utc": datetime.now(UTC).isoformat(),
         "probabilities": {"home": round(p_home, 6), "draw": round(p_draw, 6), "away": round(p_away, 6), "sum": round(p_home + p_draw + p_away, 6)},
@@ -1451,6 +1531,37 @@ def sync_payload() -> dict[str, Any]:
     }
 
 
+def coverage_payload() -> dict[str, Any]:
+    props = merged_props()
+    competition_rows: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in props:
+        competition_rows[f"{row.get('pais', 'N/D')} · {row.get('liga', 'N/D')}"] .append(row)
+    fixture_ids = sorted(str(row.get("fixture_id") or row.get("id") or "") for row in props)
+    competitions = []
+    for name, rows in sorted(competition_rows.items()):
+        competitions.append({
+            "competition": name, "fixtures": len(rows),
+            "ready": sum(row.get("analysis_status") == "READY" for row in rows),
+            "abstained": sum(row.get("analysis_status") == "ABSTAINED" for row in rows),
+            "unavailable": sum(row.get("analysis_status") == "UNAVAILABLE" for row in rows),
+            "advanced_complete": sum(all((row.get(field) or "N/D") != "N/D" for field in
+                                         ("corners_proyeccion", "tarjetas_proyeccion", "disparos_proyeccion")) for row in rows),
+        })
+    return {
+        "contract_version": CONTRACT_VERSION, "date": _catalog_date,
+        "provider": "API_FOOTBALL", "timezone": "America/Bogota",
+        "provider_catalog_count": len(_catalog), "delivered_count": len(props),
+        "fixture_id_sha256": hashlib.sha256("|".join(fixture_ids).encode()).hexdigest(),
+        "countries": len({row.get("pais") for row in props}), "competitions": len(competitions),
+        "ready": sum(row.get("analysis_status") == "READY" for row in props),
+        "abstained": sum(row.get("analysis_status") == "ABSTAINED" for row in props),
+        "unavailable": sum(row.get("analysis_status") == "UNAVAILABLE" for row in props),
+        "advanced_complete": sum(all((row.get(field) or "N/D") != "N/D" for field in
+                                     ("corners_proyeccion", "tarjetas_proyeccion", "disparos_proyeccion")) for row in props),
+        "competition_coverage": competitions,
+    }
+
+
 async def execute_calibration(date: str, max_leagues: int, advanced: bool) -> None:
     global _calibration_state, _calibration_job_id
     _calibration_job_id = str(uuid.uuid4())
@@ -1517,7 +1628,14 @@ async def meta() -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION, "engine_version": ENGINE_VERSION,
         "model_version": MODEL_VERSION,
-        "model_parameters": {"rho": DIXON_COLES_RHO, "shrinkage": SHRINKAGE_MATCHES, "recency_strength": RECENCY_STRENGTH},
+        "model_parameters": {
+            "rho": DIXON_COLES_RHO, "shrinkage": SHRINKAGE_MATCHES,
+            "recency_strength": RECENCY_STRENGTH, "advanced_shrinkage": ADVANCED_SHRINKAGE,
+        },
+        "evidence_hierarchy": [
+            "same_competition_current_season", "recent_official_cross_competition",
+            "competition_previous_season_prior", "abstain_if_still_insufficient",
+        ],
         "calibration_status": latest.get("status") if latest else MODEL_VALIDATION_STATUS,
         "calibration_run_id": latest.get("run_id") if latest else None,
         "viability_status": "NOT_CERTIFIED", "timezone": "America/Bogota",
@@ -1597,6 +1715,17 @@ async def sync_status(date: str | None = Query(None)) -> dict[str, Any]:
         return sync_payload()
     except Exception as exc:
         log.exception("No se pudo sincronizar el catálogo")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/coverage")
+async def coverage(date: str | None = Query(None)) -> dict[str, Any]:
+    requested = date or now_local().strftime("%Y-%m-%d")
+    try:
+        await load_catalog(requested, False)
+        return coverage_payload()
+    except Exception as exc:
+        log.exception("No se pudo auditar cobertura")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 

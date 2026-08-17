@@ -31,6 +31,7 @@ SHRINKAGE_GRID = (4.0, 6.0, 8.0, 10.0, 12.0)
 RECENCY_GRID = (0.0, 0.10, 0.20)
 ADVANCED_LINES = {"corners": 8.5, "cards": 4.5, "shots": 20.5}
 CALL_BUDGET = max(100, min(int(os.getenv("CALIBRATION_CALL_BUDGET", "5000")), 20_000))
+V2_CANDIDATE = {"rho": -0.05, "shrinkage": 12.0, "recency": 0.0}
 
 
 def progress(phase: str, done: int, total: int) -> None:
@@ -296,6 +297,51 @@ def choose_parameters(train: list[BacktestPoint]) -> tuple[dict[str, float], dic
     return best_params, best_score or {}
 
 
+def improvement_percent(reference: float, candidate: float) -> float:
+    return round(100 * (reference - candidate) / reference, 4) if reference else 0.0
+
+
+def walk_forward_report(points: list[BacktestPoint], folds: int = 4) -> dict[str, Any]:
+    """Repeated expanding-window validation with no future leakage."""
+    if len(points) < 400 or folds < 2:
+        return {"status": "INSUFFICIENT", "points": len(points), "folds": 0}
+    initial_train = len(points) // 2
+    block = max((len(points) - initial_train) // folds, 1)
+    reports: list[dict[str, Any]] = []
+    for index in range(folds):
+        test_start = initial_train + index * block
+        test_end = len(points) if index == folds - 1 else min(test_start + block, len(points))
+        train, test = points[:test_start], points[test_start:test_end]
+        if len(test) < 30:
+            continue
+        selected_params, _ = choose_parameters(train)
+        candidate = score_points(test, V2_CANDIDATE["rho"], V2_CANDIDATE["shrinkage"], V2_CANDIDATE["recency"])
+        legacy = score_points(test, -0.08, 6.0, 1.0)
+        naive = naive_baseline(train, test)
+        improvement = {
+            "vs_legacy_log_loss_pct": improvement_percent(legacy["log_loss"], candidate["log_loss"]),
+            "vs_legacy_brier_pct": improvement_percent(legacy["brier_1x2"], candidate["brier_1x2"]),
+            "vs_naive_log_loss_pct": improvement_percent(naive["log_loss"], candidate["log_loss"]),
+            "vs_naive_brier_pct": improvement_percent(naive["brier_1x2"], candidate["brier_1x2"]),
+        }
+        reports.append({
+            "fold": index + 1, "train_n": len(train), "test_n": len(test),
+            "test_from": test[0].kickoff, "test_to": test[-1].kickoff,
+            "selected_parameters_on_fold_train": selected_params,
+            "v2_candidate_parameters": V2_CANDIDATE,
+            "candidate": candidate, "legacy_v1": legacy,
+            "naive": naive, "improvement": improvement,
+            "passes": all(value > 0.0 for value in improvement.values()),
+        })
+    pass_count = sum(bool(row["passes"]) for row in reports)
+    stable = len(reports) >= 4 and pass_count >= 3
+    return {
+        "status": "EVALUATED", "folds": len(reports), "passing_folds": pass_count,
+        "stable_candidate": stable, "required_passing_folds": 3,
+        "reports": reports,
+    }
+
+
 def advanced_totals(row: dict[str, Any]) -> dict[str, float | None]:
     totals: dict[str, list[float]] = defaultdict(list)
     for block in row.get("statistics") or []:
@@ -417,7 +463,7 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
         params, train_score = await asyncio.to_thread(choose_parameters, train)
         progress("PARAMETER_SEARCH", 1, 1)
         holdout_score = await asyncio.to_thread(score_points, holdout, params["rho"], params["shrinkage"], params["recency"])
-        current_model_holdout = await asyncio.to_thread(score_points, holdout, -0.08, 6.0, 1.0)
+        legacy_v1_holdout = await asyncio.to_thread(score_points, holdout, -0.08, 6.0, 1.0)
         naive_holdout = await asyncio.to_thread(naive_baseline, train, holdout)
         bins = await asyncio.to_thread(calibration_bins, holdout, params["rho"], params["shrinkage"], params["recency"])
         per_league: dict[str, Any] = {}
@@ -442,17 +488,22 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             advanced = await asyncio.to_thread(advanced_report, all_points, advanced_stats)
 
         improvement = {
-            "vs_current_log_loss_pct": round(100 * (current_model_holdout["log_loss"] - holdout_score["log_loss"]) / current_model_holdout["log_loss"], 4),
-            "vs_current_brier_pct": round(100 * (current_model_holdout["brier_1x2"] - holdout_score["brier_1x2"]) / current_model_holdout["brier_1x2"], 4),
-            "vs_naive_log_loss_pct": round(100 * (naive_holdout["log_loss"] - holdout_score["log_loss"]) / naive_holdout["log_loss"], 4),
-            "vs_naive_brier_pct": round(100 * (naive_holdout["brier_1x2"] - holdout_score["brier_1x2"]) / naive_holdout["brier_1x2"], 4),
+            "vs_legacy_log_loss_pct": improvement_percent(legacy_v1_holdout["log_loss"], holdout_score["log_loss"]),
+            "vs_legacy_brier_pct": improvement_percent(legacy_v1_holdout["brier_1x2"], holdout_score["brier_1x2"]),
+            "vs_naive_log_loss_pct": improvement_percent(naive_holdout["log_loss"], holdout_score["log_loss"]),
+            "vs_naive_brier_pct": improvement_percent(naive_holdout["brier_1x2"], holdout_score["brier_1x2"]),
         }
+        progress("WALK_FORWARD", 0, 1)
+        walk_forward = await asyncio.to_thread(walk_forward_report, all_points, 4)
+        progress("WALK_FORWARD", 1, 1)
         promotion_candidate = (
             len(holdout) >= 500
-            and improvement["vs_current_log_loss_pct"] > 1.0
-            and improvement["vs_current_brier_pct"] > 1.0
+            and params == V2_CANDIDATE
+            and improvement["vs_legacy_log_loss_pct"] > 1.0
+            and improvement["vs_legacy_brier_pct"] > 1.0
             and improvement["vs_naive_log_loss_pct"] > 0.0
             and improvement["vs_naive_brier_pct"] > 0.0
+            and bool(walk_forward.get("stable_candidate"))
         )
 
         report = {
@@ -460,8 +511,9 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             "created_at": datetime.now(main.UTC).isoformat(), "leagues_requested": len(selected),
             "leagues_loaded": len(league_points), "points": len(all_points), "train_n": len(train), "holdout_n": len(holdout),
             "parameters": params, "train": train_score, "holdout": holdout_score,
-            "current_model_holdout": current_model_holdout, "naive_holdout": naive_holdout,
+            "legacy_v1_holdout": legacy_v1_holdout, "naive_holdout": naive_holdout,
             "improvement": improvement, "promotion_candidate": promotion_candidate,
+            "walk_forward": walk_forward,
             "calibration_bins": bins, "expected_calibration_error": expected_calibration_error(bins),
             "per_league": per_league, "advanced": advanced, "provider_errors": errors,
             "api_budget": {"configured_calls": CALL_BUDGET, "advanced_fixtures_requested": len(advanced_ids) if include_advanced else 0},

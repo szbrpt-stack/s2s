@@ -39,6 +39,12 @@ def progress(phase: str, done: int, total: int) -> None:
         "phase": phase, "done": done, "total": max(total, 1),
         "progress": round(done / max(total, 1), 4),
     })
+    job_id = getattr(main, "_calibration_job_id", None)
+    if job_id:
+        main.db_checkpoint_calibration_job(
+            job_id, "RUNNING", phase, done, total,
+            {key: main._calibration_state.get(key) for key in ("started_at", "run_id", "error")},
+        )
 
 
 @dataclass(frozen=True)

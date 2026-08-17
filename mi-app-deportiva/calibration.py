@@ -500,16 +500,22 @@ async def fetch_rows(client: httpx.AsyncClient, league_id: int, season: int) -> 
     return [row for row in response if isinstance(row, dict)] if isinstance(response, list) else []
 
 
-async def fetch_advanced(client: httpx.AsyncClient, fixture_ids: list[int]) -> dict[int, dict[str, float | None]]:
-    result: dict[int, dict[str, float | None]] = {}
-    batches = main.chunks(fixture_ids, 20)
+async def fetch_advanced(client: httpx.AsyncClient, fixture_ids: list[int]) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = await asyncio.to_thread(main.db_load_advanced_stats, fixture_ids)
+    missing = [fixture_id for fixture_id in fixture_ids if fixture_id not in result]
+    batches = main.chunks(missing, 20)
+    fetched: dict[int, dict[str, Any]] = {}
     for index, batch in enumerate(batches, 1):
         rows = await main.provider_get(client, "/fixtures", {"ids": "-".join(map(str, batch))})
         for row in rows if isinstance(rows, list) else []:
             fixture_id = int((row.get("fixture") or {}).get("id") or 0)
             if fixture_id:
-                result[fixture_id] = advanced_totals(row)
+                parsed = advanced_totals(row)
+                result[fixture_id] = parsed
+                fetched[fixture_id] = parsed
         progress("ADVANCED_STATS", index, len(batches))
+    await asyncio.to_thread(main.db_save_advanced_stats, fetched)
+    main.log.info("Dataset avanzado: cache=%s nuevos=%s solicitados=%s", len(result) - len(fetched), len(fetched), len(fixture_ids))
     return result
 
 
@@ -524,7 +530,10 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             key = (int(league.get("id") or 0), int(league.get("season") or 0))
             if all(key):
                 league_counts[key] += 1
-        selected = [key for key, _ in sorted(league_counts.items(), key=lambda item: (-item[1], item[0]))[:max_leagues]]
+        current = [key for key, _ in sorted(league_counts.items(), key=lambda item: (-item[1], item[0]))[:max_leagues]]
+        # Dos temporadas aumentan potencia estadística sin mezclar el futuro:
+        # cada serie se reconstruye cronológicamente y conserva liga/temporada.
+        selected = list(dict.fromkeys(current + [(league_id, season - 1) for league_id, season in current if season > 1900]))
         semaphore = asyncio.Semaphore(6)
         loaded_count = 0
 

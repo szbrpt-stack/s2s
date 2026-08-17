@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
 
-ENGINE_VERSION = "5.0.0"
+ENGINE_VERSION = "5.1.0"
 CONTRACT_VERSION = "5.0"
 MODEL_VERSION = "dc-shrunk-v2-walk-forward-validated"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_VALIDATED_NOT_EXTERNALLY_CERTIFIED"
@@ -579,16 +579,67 @@ def btts_history(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metric: str, line: float) -> dict[str, Any]:
     home_values = [float(m[metric]) for m in home if m.get(metric) is not None]
     away_values = [float(m[metric]) for m in away if m.get(metric) is not None]
-    if len(home_values) < 3 or len(away_values) < 3:
+    team_field = f"{metric}_team"
+    home_own = [float(m[team_field]) for m in home if m.get(team_field) is not None and m.get(metric) is not None]
+    away_own = [float(m[team_field]) for m in away if m.get(team_field) is not None and m.get(metric) is not None]
+    home_allowed = [float(m[metric]) - float(m[team_field]) for m in home if m.get(team_field) is not None and m.get(metric) is not None]
+    away_allowed = [float(m[metric]) - float(m[team_field]) for m in away if m.get(team_field) is not None and m.get(metric) is not None]
+    if min(len(home_values), len(away_values), len(home_own), len(away_own)) < 3:
         return {"available": False, "reason": "Cobertura oficial insuficiente", "sample": len(home_values) + len(away_values)}
     combined = home_values + away_values
-    projection = sum(combined) / len(combined)
-    over_rate = sum(value > line for value in combined) / len(combined)
-    direction = "OVER" if over_rate >= 0.5 else "UNDER"
-    frequency = over_rate if direction == "OVER" else 1 - over_rate
+    league_team_prior = sum(combined) / (2 * len(combined))
+
+    def venue_or_all(rows: list[dict[str, Any]], values: list[float], venue: str, allowed: bool = False) -> list[float]:
+        selected = []
+        for row in rows:
+            if row.get("venue") != venue or row.get(team_field) is None or row.get(metric) is None:
+                continue
+            selected.append(float(row[metric]) - float(row[team_field]) if allowed else float(row[team_field]))
+        return selected if len(selected) >= 3 else values
+
+    def regularized(values: list[float]) -> float:
+        observed = sum(values) / len(values)
+        weight = len(values) / (len(values) + SHRINKAGE_MATCHES)
+        return weight * observed + (1 - weight) * league_team_prior
+
+    # Producción propia y concesión rival se estiman por separado. La muestra
+    # casa/fuera se usa cuando alcanza el mínimo; en otro caso se retrocede a
+    # todos los partidos, siempre anteriores al kickoff.
+    expected_home = (regularized(venue_or_all(home, home_own, "HOME")) + regularized(venue_or_all(away, away_allowed, "AWAY", True))) / 2
+    expected_away = (regularized(venue_or_all(away, away_own, "AWAY")) + regularized(venue_or_all(home, home_allowed, "HOME", True))) / 2
+    projection = max(0.05, expected_home + expected_away)
+    sample_mean = sum(combined) / len(combined)
+    variance = sum((value - sample_mean) ** 2 for value in combined) / max(len(combined) - 1, 1)
+    dispersion = sample_mean * sample_mean / (variance - sample_mean) if variance > sample_mean + 0.01 else None
+
+    def probability_at_most(limit: int) -> float:
+        if dispersion is None:
+            probability = math.exp(-projection)
+            total = probability
+            for count in range(1, limit + 1):
+                probability *= projection / count
+                total += probability
+            return clamp(total, 0.0, 1.0)
+        size = clamp(dispersion, 0.25, 1000.0)
+        success = size / (size + projection)
+        probability = success**size
+        total = probability
+        for count in range(1, limit + 1):
+            probability *= ((count - 1 + size) / count) * (1 - success)
+            total += probability
+        return clamp(total, 0.0, 1.0)
+
+    over_probability = 1.0 - probability_at_most(math.floor(line))
+    direction = "OVER" if over_probability >= 0.5 else "UNDER"
+    frequency = over_probability if direction == "OVER" else 1 - over_probability
     return {
         "available": True, "line": line, "direction": direction,
         "projection": round(projection, 2), "frequency": round(frequency, 4),
+        "probability_over": round(over_probability, 6),
+        "expected_home": round(expected_home, 3), "expected_away": round(expected_away, 3),
+        "distribution": "NEGATIVE_BINOMIAL" if dispersion is not None else "POISSON",
+        "dispersion": round(dispersion, 4) if dispersion is not None else None,
+        "validation_status": "EXPERIMENTAL_NOT_WALK_FORWARD_VALIDATED",
         "home_frequency": round(sum((v > line) if direction == "OVER" else (v < line) for v in home_values) / len(home_values), 4),
         "away_frequency": round(sum((v > line) if direction == "OVER" else (v < line) for v in away_values) / len(away_values), 4),
         "sample": len(combined),

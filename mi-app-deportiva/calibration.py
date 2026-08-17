@@ -30,6 +30,7 @@ RHO_GRID = (-0.15, -0.12, -0.10, -0.08, -0.05, 0.0)
 SHRINKAGE_GRID = (4.0, 6.0, 8.0, 10.0, 12.0)
 RECENCY_GRID = (0.0, 0.10, 0.20)
 ADVANCED_LINES = {"corners": 8.5, "cards": 4.5, "shots": 20.5}
+ADVANCED_SHRINKAGE_GRID = (6.0, 12.0, 20.0)
 CALL_BUDGET = max(100, min(int(os.getenv("CALIBRATION_CALL_BUDGET", "5000")), 20_000))
 V2_CANDIDATE = {"rho": -0.05, "shrinkage": 12.0, "recency": 0.0}
 
@@ -342,32 +343,151 @@ def walk_forward_report(points: list[BacktestPoint], folds: int = 4) -> dict[str
     }
 
 
-def advanced_totals(row: dict[str, Any]) -> dict[str, float | None]:
+def advanced_totals(row: dict[str, Any]) -> dict[str, Any]:
     totals: dict[str, list[float]] = defaultdict(list)
+    teams: dict[int, dict[str, float | None]] = {}
     for block in row.get("statistics") or []:
         values = main.stat_map(block)
+        team_id = int((block.get("team") or {}).get("id") or 0)
+        if team_id:
+            teams[team_id] = values
         for metric in ADVANCED_LINES:
             if values.get(metric) is not None:
                 totals[metric].append(float(values[metric]))
-    return {metric: sum(totals[metric]) if totals[metric] else None for metric in ADVANCED_LINES}
+    result: dict[str, Any] = {metric: sum(totals[metric]) if totals[metric] else None for metric in ADVANCED_LINES}
+    result["teams"] = teams
+    return result
 
 
-def advanced_report(points: list[BacktestPoint], stats: dict[int, dict[str, float | None]]) -> dict[str, Any]:
+def count_cdf(limit: int, expected: float, history: list[float]) -> tuple[float, str, float | None]:
+    """CDF Poisson/NB sin SciPy; NB sólo cuando la muestra demuestra sobredispersión."""
+    expected = max(expected, 0.01)
+    sample_mean = mean(history) or expected
+    variance = sum((value - sample_mean) ** 2 for value in history) / max(len(history) - 1, 1)
+    dispersion = sample_mean * sample_mean / (variance - sample_mean) if len(history) >= 20 and variance > sample_mean + 0.01 else None
+    if dispersion is None:
+        probability = math.exp(-expected)
+        total = probability
+        for count in range(1, limit + 1):
+            probability *= expected / count
+            total += probability
+        return clamp(total, 0.0, 1.0), "POISSON", None
+    size = clamp(dispersion, 0.25, 1000.0)
+    success = size / (size + expected)
+    probability = success**size
+    total = probability
+    for count in range(1, limit + 1):
+        probability *= ((count - 1 + size) / count) * (1 - success)
+        total += probability
+    return clamp(total, 0.0, 1.0), "NEGATIVE_BINOMIAL", size
+
+
+def advanced_records(points: list[BacktestPoint], stats: dict[int, dict[str, Any]], metric: str) -> list[tuple[BacktestPoint, float, float]]:
+    records = []
+    for point in points:
+        row = stats.get(point.fixture_id) or {}
+        teams = row.get("teams") or {}
+        home = (teams.get(point.home_id) or teams.get(str(point.home_id)) or {}).get(metric)
+        away = (teams.get(point.away_id) or teams.get(str(point.away_id)) or {}).get(metric)
+        # Compatibilidad con reportes antiguos que sólo conservaban el total:
+        # sirven como baseline descriptivo, pero no para el modelo individual.
+        if home is not None and away is not None:
+            records.append((point, float(home), float(away)))
+    return records
+
+
+def score_advanced_window(
+    records: list[tuple[BacktestPoint, float, float]], train_end: int, test_end: int,
+    line: float, shrinkage: float,
+) -> dict[str, Any]:
+    team_home_for: defaultdict[int, list[float]] = defaultdict(list)
+    team_home_against: defaultdict[int, list[float]] = defaultdict(list)
+    team_away_for: defaultdict[int, list[float]] = defaultdict(list)
+    team_away_against: defaultdict[int, list[float]] = defaultdict(list)
+    league_home: defaultdict[tuple[int, int], list[float]] = defaultdict(list)
+    league_away: defaultdict[tuple[int, int], list[float]] = defaultdict(list)
+    totals: list[float] = []
+    overs = 1.0
+
+    def update(record: tuple[BacktestPoint, float, float]) -> None:
+        nonlocal overs
+        point, home_value, away_value = record
+        key = (point.league_id, point.season)
+        team_home_for[point.home_id].append(home_value)
+        team_home_against[point.home_id].append(away_value)
+        team_away_for[point.away_id].append(away_value)
+        team_away_against[point.away_id].append(home_value)
+        league_home[key].append(home_value); league_away[key].append(away_value)
+        total = home_value + away_value
+        totals.append(total); overs += int(total > line)
+
+    for record in records[:train_end]:
+        update(record)
+    if train_end <= 0 or test_end <= train_end:
+        return {"n": 0}
+    baseline_probability = overs / (train_end + 2)
+    candidate_brier = baseline_brier = log_loss = 0.0
+    distributions: defaultdict[str, int] = defaultdict(int)
+    for record in records[train_end:test_end]:
+        point, home_value, away_value = record
+        key = (point.league_id, point.season)
+        base_home = mean(league_home[key]) or mean([v for values in league_home.values() for v in values]) or max((mean(totals) or 2.0) / 2, 0.1)
+        base_away = mean(league_away[key]) or mean([v for values in league_away.values() for v in values]) or base_home
+        hf = shrunk(mean(team_home_for[point.home_id][-20:]), base_home, len(team_home_for[point.home_id][-20:]), shrinkage)
+        aa = shrunk(mean(team_away_against[point.away_id][-20:]), base_home, len(team_away_against[point.away_id][-20:]), shrinkage)
+        af = shrunk(mean(team_away_for[point.away_id][-20:]), base_away, len(team_away_for[point.away_id][-20:]), shrinkage)
+        ha = shrunk(mean(team_home_against[point.home_id][-20:]), base_away, len(team_home_against[point.home_id][-20:]), shrinkage)
+        expected = max(0.05, (hf + aa) / 2 + (af + ha) / 2)
+        cdf, distribution, _ = count_cdf(math.floor(line), expected, totals[-500:])
+        probability = clamp(1 - cdf, EPS, 1 - EPS)
+        actual = 1.0 if home_value + away_value > line else 0.0
+        candidate_brier += (probability - actual) ** 2
+        baseline_brier += (baseline_probability - actual) ** 2
+        log_loss -= actual * math.log(probability) + (1 - actual) * math.log(1 - probability)
+        distributions[distribution] += 1
+        update(record)
+    n = test_end - train_end
+    candidate = candidate_brier / n
+    baseline = baseline_brier / n
+    return {
+        "n": n, "brier": round(candidate, 6), "log_loss": round(log_loss / n, 6),
+        "baseline_brier": round(baseline, 6),
+        "brier_improvement_pct": improvement_percent(baseline, candidate),
+        "distributions": dict(distributions),
+    }
+
+
+def advanced_report(points: list[BacktestPoint], stats: dict[int, dict[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for metric, line in ADVANCED_LINES.items():
-        chron = [point for point in points if stats.get(point.fixture_id, {}).get(metric) is not None]
-        split = int(len(chron) * 0.7)
-        train_values = [float(stats[p.fixture_id][metric]) for p in chron[:split]]
-        test = chron[split:]
-        if len(train_values) < 30 or not test:
-            result[metric] = {"status": "INSUFFICIENT", "n": len(chron), "line": line}
+        records = advanced_records(points, stats, metric)
+        split = int(len(records) * 0.7)
+        if split < 100 or len(records) - split < 40:
+            result[metric] = {"status": "INSUFFICIENT", "n": len(records), "line": line,
+                              "reason": "Se requieren estadísticas por equipo: mínimo 100 train / 40 holdout."}
             continue
-        prior = (sum(value > line for value in train_values) + 1) / (len(train_values) + 2)
-        brier = sum((prior - (1.0 if float(stats[p.fixture_id][metric]) > line else 0.0)) ** 2 for p in test) / len(test)
+        validation_start = max(60, int(split * 0.75))
+        choices = [(score_advanced_window(records[:split], validation_start, split, line, k)["brier"], k) for k in ADVANCED_SHRINKAGE_GRID]
+        shrinkage = min(choices)[1]
+        holdout = score_advanced_window(records, split, len(records), line, shrinkage)
+        initial = max(80, int(len(records) * 0.4))
+        block = max(1, (len(records) - initial) // 4)
+        folds = []
+        for index in range(4):
+            train_end = initial + index * block
+            test_end = len(records) if index == 3 else min(len(records), train_end + block)
+            fold = score_advanced_window(records, train_end, test_end, line, shrinkage)
+            fold["fold"] = index + 1
+            fold["passes"] = fold.get("brier_improvement_pct", -1) > 0
+            folds.append(fold)
+        passing = sum(bool(fold["passes"]) for fold in folds)
+        candidate = holdout.get("brier_improvement_pct", -1) > 0 and passing >= 3
         result[metric] = {
-            "status": "EVALUATED", "line": line, "train_n": len(train_values), "test_n": len(test),
-            "train_over_frequency": round(prior, 6), "holdout_brier": round(brier, 6),
-            "note": "Baseline empírico; no se promueve como modelo predictivo.",
+            "status": "EVALUATED_NOT_PROMOTED", "line": line, "n": len(records),
+            "train_n": split, "test_n": len(records) - split, "shrinkage": shrinkage,
+            "holdout": holdout, "walk_forward": {"folds": folds, "passing_folds": passing},
+            "promotion_candidate": candidate,
+            "note": "Modelo individual de conteo; requiere auditoría humana antes de cualquier promoción.",
         }
     return result
 

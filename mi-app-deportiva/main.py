@@ -35,9 +35,9 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "5.5.0"
+ENGINE_VERSION = "5.6.0"
 CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v2-under-evaluation"
+MODEL_VERSION = "dc-shrunk-v3-league-coherent-evaluation"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
@@ -56,7 +56,8 @@ HISTORY_SIZE = max(5, min(int(os.getenv("HISTORY_SIZE", "10")), 20))
 MIN_HISTORY = max(3, min(int(os.getenv("MIN_HISTORY", "5")), HISTORY_SIZE))
 MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
 MIN_EVIDENCE_QUALITY = max(0, min(int(os.getenv("MIN_EVIDENCE_QUALITY", "55")), 100))
-STALE_NS_MINUTES = max(90, int(os.getenv("STALE_NS_MINUTES", "180")))
+MAX_GOALS_HISTORY_GAP = max(0.10, min(float(os.getenv("MAX_GOALS_HISTORY_GAP", "0.30")), 0.50))
+STALE_NS_MINUTES = max(5, int(os.getenv("STALE_NS_MINUTES", "15")))
 SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "12")))
 DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.05")), 0.05))
 RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.0")), 1.0))
@@ -749,7 +750,12 @@ async def team_profile(
         # API-Football rechaza actualmente la combinación `last` + `status`.
         # Solicitamos una ventana mayor y conservamos localmente solo finalizados
         # anteriores al kickoff, hasta completar HISTORY_SIZE observaciones.
-        fixtures_task = provider_get(client, "/fixtures", {"team": team_id, "last": min(HISTORY_SIZE * 2, 40)})
+        # Forma reciente coherente con la competición objetivo. Mezclar copas o
+        # amistosos con medias de liga sesga la comparación interna.
+        fixtures_task = provider_get(
+            client, "/fixtures",
+            {"team": team_id, "league": league_id, "season": season, "last": min(HISTORY_SIZE * 2, 40)},
+        )
         stats_task = provider_get(
             client,
             "/teams/statistics",
@@ -1099,6 +1105,22 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
     goals_line = 2.5
     home_goal_hist = history(home["matches"], "goals", goals_line, goals_direction)
     away_goal_hist = history(away["matches"], "goals", goals_line, goals_direction)
+    goal_hist = home_goal_hist + away_goal_hist
+    empirical_direction_rate = sum(bool(row.get("cumple")) for row in goal_hist) / len(goal_hist)
+    sampling_margin = 2.0 * math.sqrt(max(empirical_direction_rate * (1 - empirical_direction_rate), 0.01) / len(goal_hist))
+    coherence_limit = max(MAX_GOALS_HISTORY_GAP, sampling_margin)
+    coherence_gap = abs(goals_probability - empirical_direction_rate)
+    if coherence_gap > coherence_limit:
+        reason = (
+            f"Modelo e historial no convergen: probabilidad={goals_probability:.1%}, "
+            f"frecuencia={empirical_direction_rate:.1%}, límite={coherence_limit:.1%}"
+        )
+        return {**shell, "analysis_status": "ABSTAINED", "analysis_message": reason,
+                "abstention_reasons": [reason], "status_verdict": "INCOHERENCIA_MODELO_HISTORIAL",
+                "data_quality": 0, "sample_size": len(goal_hist),
+                "coherence": {"probability": round(goals_probability, 6),
+                              "historical_frequency": round(empirical_direction_rate, 6),
+                              "gap": round(coherence_gap, 6), "limit": round(coherence_limit, 6)}}
     corners = metric_evidence(home["matches"], away["matches"], "corners", 8.5)
     cards = metric_evidence(home["matches"], away["matches"], "cards", 4.5)
     shots = metric_evidence(home["matches"], away["matches"], "shots", 20.5)
@@ -1215,7 +1237,13 @@ def merged_props() -> list[dict[str, Any]]:
 
 async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> None:
     global _snapshots
-    candidates = [fixture for fixture in fixtures if base_shell(fixture)["is_upcoming"] and base_shell(fixture)["fixture_id"] not in _snapshots]
+    candidates = []
+    for fixture in fixtures:
+        shell = base_shell(fixture)
+        snapshot = _snapshots.get(shell["fixture_id"])
+        outdated = bool(snapshot and snapshot.get("model_version") != MODEL_VERSION)
+        if shell["is_upcoming"] and (snapshot is None or outdated):
+            candidates.append(fixture)
     candidates.sort(key=lambda fixture: fixture_state(fixture.get("fixture") or {})["timestamp"])
     _progress.update(
         phase="TEAM_AND_LEAGUE_DATA", done=0, total=max(len(candidates), 1),

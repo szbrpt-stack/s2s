@@ -19,6 +19,7 @@ import math
 import os
 import sqlite3
 import time
+import uuid
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -34,10 +35,10 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "5.3.0"
+ENGINE_VERSION = "5.5.0"
 CONTRACT_VERSION = "5.0"
-MODEL_VERSION = "dc-shrunk-v2-walk-forward-validated"
-MODEL_VALIDATION_STATUS = "WALK_FORWARD_VALIDATED_NOT_EXTERNALLY_CERTIFIED"
+MODEL_VERSION = "dc-shrunk-v2-under-evaluation"
+MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 UTC = timezone.utc
@@ -54,6 +55,7 @@ H2H_TTL = max(3600, int(os.getenv("H2H_TTL_SECONDS", "86400")))
 HISTORY_SIZE = max(5, min(int(os.getenv("HISTORY_SIZE", "10")), 20))
 MIN_HISTORY = max(3, min(int(os.getenv("MIN_HISTORY", "5")), HISTORY_SIZE))
 MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
+MIN_EVIDENCE_QUALITY = max(0, min(int(os.getenv("MIN_EVIDENCE_QUALITY", "55")), 100))
 STALE_NS_MINUTES = max(90, int(os.getenv("STALE_NS_MINUTES", "180")))
 SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "12")))
 DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "-0.05")), 0.05))
@@ -80,6 +82,7 @@ _analysis_errors: dict[str, str] = {}
 _progress = {"phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0, "overall_total": 1.0, "started_at": None}
 _quota = {"daily_remaining": None, "minute_remaining": None, "last_call_at": None}
 _calibration_task: asyncio.Task[None] | None = None
+_calibration_job_id: str | None = None
 _calibration_state: dict[str, Any] = {"running": False, "started_at": None, "finished_at": None, "error": None, "run_id": None}
 
 
@@ -170,6 +173,17 @@ def init_db() -> None:
                 fixture_id BIGINT PRIMARY KEY, payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS prediction_outcomes (
+                fixture_id TEXT PRIMARY KEY, kickoff_utc TEXT,
+                model_version TEXT NOT NULL, prediction TEXT NOT NULL,
+                actual_home INTEGER NOT NULL, actual_away INTEGER NOT NULL,
+                metrics TEXT NOT NULL, resolved_at TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS calibration_jobs (
+                job_id TEXT PRIMARY KEY, status TEXT NOT NULL, phase TEXT NOT NULL,
+                done INTEGER NOT NULL, total INTEGER NOT NULL, payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""")
         log.info("Persistencia PostgreSQL inicializada")
         return
     path = Path(STATE_DB_PATH)
@@ -200,6 +214,21 @@ def init_db() -> None:
                 fixture_id INTEGER PRIMARY KEY,
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS prediction_outcomes (
+                fixture_id TEXT PRIMARY KEY, kickoff_utc TEXT,
+                model_version TEXT NOT NULL, prediction TEXT NOT NULL,
+                actual_home INTEGER NOT NULL, actual_away INTEGER NOT NULL,
+                metrics TEXT NOT NULL, resolved_at TEXT NOT NULL
+            )"""
+        )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS calibration_jobs (
+                job_id TEXT PRIMARY KEY, status TEXT NOT NULL, phase TEXT NOT NULL,
+                done INTEGER NOT NULL, total INTEGER NOT NULL, payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )"""
         )
         db.commit()
@@ -279,6 +308,39 @@ def db_save_calibration(report: dict[str, Any]) -> int:
         return int(cursor.lastrowid)
 
 
+def db_checkpoint_calibration_job(job_id: str, status: str, phase: str, done: int, total: int, payload: dict[str, Any]) -> None:
+    values = (job_id, status, phase, int(done), max(int(total), 1),
+              json.dumps(payload, ensure_ascii=False, separators=(",", ":")), datetime.now(UTC).isoformat())
+    statement = """INSERT INTO calibration_jobs(job_id,status,phase,done,total,payload,updated_at)
+       VALUES({placeholders}) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,
+       phase=excluded.phase,done=excluded.done,total=excluded.total,payload=excluded.payload,updated_at=excluded.updated_at"""
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            db.execute(statement.format(placeholders="%s,%s,%s,%s,%s,%s,%s"), values)
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            db.execute(statement.format(placeholders="?,?,?,?,?,?,?"), values)
+            db.commit()
+
+
+def db_latest_calibration_job() -> dict[str, Any] | None:
+    query = "SELECT job_id,status,phase,done,total,payload,updated_at FROM calibration_jobs ORDER BY updated_at DESC LIMIT 1"
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            row = db.execute(query).fetchone()
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            row = db.execute(query).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[5])
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    return {"job_id": row[0], "status": row[1], "phase": row[2], "done": row[3], "total": row[4],
+            "payload": payload, "updated_at": row[6]}
+
+
 def db_load_advanced_stats(fixture_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not fixture_ids:
         return {}
@@ -327,6 +389,165 @@ def db_save_advanced_stats(rows: dict[int, dict[str, Any]]) -> None:
                 values,
             )
             db.commit()
+
+
+def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict[str, Any]]) -> int:
+    values = []
+    for fixture in catalog:
+        shell = base_shell(fixture)
+        snapshot = snapshots.get(shell["fixture_id"])
+        goals = fixture.get("goals") or {}
+        if not snapshot or snapshot.get("analysis_status") != "READY" or not shell["is_finished"]:
+            continue
+        if goals.get("home") is None or goals.get("away") is None:
+            continue
+        kickoff = parse_dt(shell.get("kickoff_utc"))
+        cutoff = parse_dt(snapshot.get("snapshot_cutoff_utc"))
+        if not kickoff or not cutoff or cutoff >= kickoff:
+            log.warning("Outcome excluido por integridad temporal fixture=%s cutoff=%s kickoff=%s", shell["fixture_id"], cutoff, kickoff)
+            continue
+        actual_home, actual_away = int(goals["home"]), int(goals["away"])
+        actual = 0 if actual_home > actual_away else 1 if actual_home == actual_away else 2
+        probabilities = [float(snapshot.get(key) or 0) / 100 for key in ("p_home", "p_draw", "p_away")]
+        total_probability = sum(probabilities)
+        if total_probability <= 0:
+            continue
+        probabilities = [value / total_probability for value in probabilities]
+        log_loss = -math.log(max(probabilities[actual], 1e-12))
+        brier = sum((probability - (1.0 if index == actual else 0.0)) ** 2
+                    for index, probability in enumerate(probabilities))
+        goals_metric = ((snapshot.get("metrics") or {}).get("goals_2_5") or {})
+        direction_probability = as_float(goals_metric.get("probability"))
+        probability_over = None
+        brier_over = None
+        if direction_probability is not None:
+            probability_over = direction_probability if goals_metric.get("direction") == "OVER" else 1 - direction_probability
+            brier_over = (probability_over - (1.0 if actual_home + actual_away >= 3 else 0.0)) ** 2
+        metrics = {
+            "log_loss_1x2": round(log_loss, 8), "brier_1x2": round(brier, 8),
+            "correct_1x2": int(max(range(3), key=lambda index: probabilities[index]) == actual),
+            "modal_correct": int(snapshot.get("marcador_estimado") == f"{actual_home} - {actual_away}"),
+            "brier_over25": round(brier_over, 8) if brier_over is not None else None,
+            "probability_over25": round(probability_over, 8) if probability_over is not None else None,
+            "baseline_log_loss_1x2": round(-math.log((0.45, 0.28, 0.27)[actual]), 8),
+            "baseline_brier_1x2": round(sum((p - (1.0 if i == actual else 0.0)) ** 2 for i, p in enumerate((0.45, 0.28, 0.27))), 8),
+            "baseline_brier_over25": round((0.5 - (1.0 if actual_home + actual_away >= 3 else 0.0)) ** 2, 8),
+            "actual_1x2": actual,
+        }
+        values.append((
+            shell["fixture_id"], shell.get("kickoff_utc"), snapshot.get("model_version") or MODEL_VERSION,
+            json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), actual_home, actual_away,
+            json.dumps(metrics, separators=(",", ":")), datetime.now(UTC).isoformat(),
+        ))
+    if not values:
+        return 0
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            with db.cursor() as cursor:
+                cursor.executemany(
+                    """INSERT INTO prediction_outcomes
+                       (fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(fixture_id) DO NOTHING""", values)
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            db.executemany(
+                """INSERT INTO prediction_outcomes
+                   (fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at)
+                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(fixture_id) DO NOTHING""", values)
+            db.commit()
+    return len(values)
+
+
+def db_model_scorecard() -> dict[str, Any]:
+    query = "SELECT kickoff_utc,prediction,metrics,resolved_at,actual_home,actual_away FROM prediction_outcomes ORDER BY resolved_at DESC LIMIT 5000"
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            rows = db.execute(query).fetchall()
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            rows = db.execute(query).fetchall()
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            records.append({"kickoff": row[0], "prediction": json.loads(row[1]), "metrics": json.loads(row[2]),
+                            "resolved_at": row[3], "actual_home": int(row[4]), "actual_away": int(row[5])})
+        except (json.JSONDecodeError, TypeError):
+            continue
+    if not records:
+        return {"status": "INSUFFICIENT", "resolved_predictions": 0, "minimum_for_reporting": 30}
+
+    def summarize(selected: list[dict[str, Any]]) -> dict[str, Any]:
+        metric_rows = [record["metrics"] for record in selected]
+        def average(field: str) -> float | None:
+            values = [float(row[field]) for row in metric_rows if row.get(field) is not None]
+            return round(sum(values) / len(values), 6) if values else None
+        n = len(metric_rows)
+        brier = average("brier_1x2")
+        baseline_brier = average("baseline_brier_1x2")
+        over_brier = average("brier_over25")
+        baseline_over = average("baseline_brier_over25")
+        return {
+            "n": n,
+            "log_loss_1x2": average("log_loss_1x2"), "brier_1x2": brier,
+            "accuracy_1x2": average("correct_1x2"), "brier_over25": over_brier,
+            "baseline_brier_1x2": baseline_brier, "baseline_brier_over25": baseline_over,
+            "brier_improvement_pct": round((baseline_brier - brier) / baseline_brier * 100, 4) if brier is not None and baseline_brier else None,
+            "over25_brier_improvement_pct": round((baseline_over - over_brier) / baseline_over * 100, 4) if over_brier is not None and baseline_over else None,
+        }
+
+    def calibration_bins(selected: list[dict[str, Any]], market: str) -> list[dict[str, Any]]:
+        buckets: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for record in selected:
+            prediction, metric = record["prediction"], record["metrics"]
+            if market == "over25":
+                probability = as_float(metric.get("probability_over25"))
+                actual = float(record["actual_home"] + record["actual_away"] >= 3) if probability is not None else None
+            else:
+                probs = [as_float(prediction.get(key), 0.0) / 100 for key in ("p_home", "p_draw", "p_away")]
+                probability = max(probs)
+                actual = float(metric.get("correct_1x2", 0))
+            if probability is None or actual is None:
+                continue
+            bucket = min(int(probability * 10), 9)
+            buckets[bucket].append((probability, actual))
+        return [{"from": bucket / 10, "to": (bucket + 1) / 10, "n": len(values),
+                 "mean_probability": round(sum(v[0] for v in values) / len(values), 4),
+                 "observed_frequency": round(sum(v[1] for v in values) / len(values), 4)}
+                for bucket, values in sorted(buckets.items())]
+
+    now = datetime.now(UTC)
+    horizons: dict[str, Any] = {}
+    for label, days in (("7d", 7), ("30d", 30), ("90d", 90)):
+        selected = [record for record in records if (parsed := parse_dt(record["kickoff"])) and parsed >= now - timedelta(days=days)]
+        horizons[label] = summarize(selected)
+    leagues: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        prediction = record["prediction"]
+        leagues[f'{prediction.get("league_id", 0)}:{prediction.get("league_name") or prediction.get("liga") or "N/D"}'].append(record)
+    by_league = {key: summarize(value) for key, value in leagues.items()}
+    overall = summarize(records)
+    n = len(records)
+    promotion = {
+        "1x2": {"eligible": n >= 300 and (overall.get("brier_improvement_pct") or -999) > 0,
+                "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
+        "goals_2_5": {"eligible": n >= 300 and (overall.get("over25_brier_improvement_pct") or -999) > 0,
+                      "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
+        "corners": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
+        "cards": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
+        "shots": {"eligible": False, "reason": "Requiere scorecard prequential independiente"},
+    }
+    return {
+        "status": "PRELIMINARY" if n < 100 else "MONITORED",
+        "resolved_predictions": n, "minimum_for_reporting": 30,
+        "overall": overall, "horizons": horizons, "by_league": by_league,
+        "calibration_bins_1x2": calibration_bins(records, "1x2"),
+        "calibration_bins_over25": calibration_bins(records, "over25"),
+        "promotion_gates": promotion,
+        "log_loss_1x2": overall.get("log_loss_1x2"), "brier_1x2": overall.get("brier_1x2"),
+        "accuracy_1x2": overall.get("accuracy_1x2"), "brier_over25": overall.get("brier_over25"),
+        "modal_accuracy": round(sum(float(record["metrics"].get("modal_correct", 0)) for record in records) / n, 6),
+        "warning": "Métrica prequential descriptiva; promoción nunca automática.",
+    }
 
 
 init_db()
@@ -883,6 +1104,12 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
     shots = metric_evidence(home["matches"], away["matches"], "shots", 20.5)
     advanced_ratio = sum(metric["available"] for metric in (corners, cards, shots)) / 3
     quality = evidence_quality(home, away, league, advanced_ratio)
+    if quality["score"] < MIN_EVIDENCE_QUALITY:
+        reason = f"Calidad de evidencia insuficiente: {quality['score']}/{MIN_EVIDENCE_QUALITY}"
+        return {**shell, "analysis_status": "ABSTAINED", "analysis_message": reason,
+                "abstention_reasons": [reason], "status_verdict": "EVIDENCIA_INSUFICIENTE",
+                "evidence_quality": quality, "data_quality": quality["score"],
+                "sample_size": len(home["matches"]) + len(away["matches"])}
     h2h = await head_to_head(client, shell["home_id"], shell["away_id"], cutoff)
     btts = sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h])))
 
@@ -914,7 +1141,7 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "sample_size": len(home["matches"]) + len(away["matches"]),
         "confidence": {
             "status": MODEL_VALIDATION_STATUS,
-            "reason": "Validado internamente en 4/4 ventanas para 1X2/goles; pendiente de certificación externa",
+            "reason": "Evaluado internamente en ventanas cronológicas; no certificado ni promovido",
         },
         "viability": None, "viability_status": "NOT_CERTIFIED",
         "metrics": {
@@ -1075,6 +1302,9 @@ async def load_catalog(fixture_date: str, force: bool = False) -> None:
         if date_changed:
             _analysis_errors.clear()
             _snapshots = await asyncio.to_thread(db_load_snapshots, fixture_date)
+        resolved = await asyncio.to_thread(db_resolve_outcomes, _catalog, _snapshots)
+        if resolved:
+            log.info("Journal verificado: %s predicciones resueltas", resolved)
         if _analysis_task is None or _analysis_task.done():
             _analysis_task = asyncio.create_task(analyze_catalog(_catalog.copy(), fixture_date))
 
@@ -1100,11 +1330,14 @@ def sync_payload() -> dict[str, Any]:
 
 
 async def execute_calibration(date: str, max_leagues: int, advanced: bool) -> None:
-    global _calibration_state
+    global _calibration_state, _calibration_job_id
+    _calibration_job_id = str(uuid.uuid4())
     _calibration_state = {
         "running": True, "started_at": datetime.now(UTC).isoformat(),
         "finished_at": None, "error": None, "run_id": None,
     }
+    await asyncio.to_thread(db_checkpoint_calibration_job, _calibration_job_id, "RUNNING", "STARTING", 0, 1,
+                            {"date": date, "max_leagues": max_leagues, "advanced": advanced})
     try:
         # Importación diferida: calibration reutiliza las primitivas verificadas
         # de este módulo sin crear un ciclo durante el arranque de Uvicorn.
@@ -1113,9 +1346,14 @@ async def execute_calibration(date: str, max_leagues: int, advanced: bool) -> No
         report = await calibration.run_calibration(date, max_leagues, advanced)
         _calibration_state["run_id"] = report.get("run_id")
         _calibration_state.update({"phase": "COMPLETE", "done": 1, "total": 1, "progress": 1.0})
+        await asyncio.to_thread(db_checkpoint_calibration_job, _calibration_job_id, "COMPLETE", "COMPLETE", 1, 1,
+                                {"date": date, "max_leagues": max_leagues, "advanced": advanced, "run_id": report.get("run_id")})
     except Exception as exc:
         log.exception("Calibración histórica fallida")
         _calibration_state["error"] = str(exc)
+        await asyncio.to_thread(db_checkpoint_calibration_job, _calibration_job_id, "FAILED", _calibration_state.get("phase", "UNKNOWN"),
+                                _calibration_state.get("done", 0), _calibration_state.get("total", 1),
+                                {"date": date, "max_leagues": max_leagues, "advanced": advanced, "error": str(exc)})
     finally:
         _calibration_state["running"] = False
         _calibration_state["finished_at"] = datetime.now(UTC).isoformat()
@@ -1170,6 +1408,7 @@ async def meta() -> dict[str, Any]:
 @app.get("/api/v1/calibration/status")
 async def calibration_status() -> dict[str, Any]:
     latest = db_latest_calibration()
+    durable_job = await asyncio.to_thread(db_latest_calibration_job)
     summary = None
     if latest:
         summary = {
@@ -1186,7 +1425,13 @@ async def calibration_status() -> dict[str, Any]:
             "promotion_candidate": latest.get("promotion_candidate", False),
             "promotion_policy": latest.get("promotion_policy"),
         }
-    return {"task": _calibration_state, "latest": summary}
+    return {"task": _calibration_state, "durable_job": durable_job, "latest": summary}
+
+
+@app.get("/api/v1/model/scorecard")
+async def model_scorecard() -> dict[str, Any]:
+    """Seguimiento prequential: sólo predicciones selladas antes del kickoff."""
+    return await asyncio.to_thread(db_model_scorecard)
 
 
 @app.post("/api/v1/calibration/run", status_code=202)
@@ -1194,12 +1439,21 @@ async def start_calibration(
     date: str | None = Query(None),
     max_leagues: int = Query(30, ge=1, le=100),
     advanced: bool = Query(True),
+    resume: bool = Query(False),
     x_s2s_admin: str | None = Header(None, alias="X-S2S-Admin"),
 ) -> dict[str, Any]:
     global _calibration_task
     require_admin(x_s2s_admin)
     if _calibration_task and not _calibration_task.done():
         raise HTTPException(status_code=409, detail="Ya existe una calibración en ejecución")
+    if resume:
+        previous = await asyncio.to_thread(db_latest_calibration_job)
+        if not previous or previous.get("status") not in {"RUNNING", "FAILED", "INTERRUPTED"}:
+            raise HTTPException(status_code=409, detail="No existe una calibración interrumpida que reanudar")
+        config = previous.get("payload") or {}
+        date = str(config.get("date") or date or now_local().strftime("%Y-%m-%d"))
+        max_leagues = int(config.get("max_leagues") or max_leagues)
+        advanced = bool(config.get("advanced", advanced))
     requested = date or now_local().strftime("%Y-%m-%d")
     try:
         datetime.strptime(requested, "%Y-%m-%d")
@@ -1208,7 +1462,8 @@ async def start_calibration(
     _calibration_task = asyncio.create_task(execute_calibration(requested, max_leagues, advanced))
     return {
         "accepted": True, "date": requested, "max_leagues": max_leagues,
-        "advanced": advanced, "message": "Backtesting cronológico iniciado; consulta /api/v1/calibration/status",
+        "advanced": advanced, "resumed": resume,
+        "message": "Backtesting cronológico iniciado con checkpoints durables; consulta /api/v1/calibration/status",
     }
 
 

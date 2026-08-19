@@ -36,7 +36,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "7.4.1"
+ENGINE_VERSION = "7.4.2"
 CONTRACT_VERSION = "7.4"
 MODEL_VERSION = "hierarchical-dc-v7.4-btts-walk-forward"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"

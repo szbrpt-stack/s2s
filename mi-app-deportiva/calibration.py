@@ -221,7 +221,10 @@ def choose_btts_parameters(points: list[BacktestPoint], base_params: dict[str, f
     return {"history_k": history_k, "max_history_weight": max_weight}, score
 
 
-def btts_walk_forward(points: list[BacktestPoint], folds: int = 4) -> dict[str, Any]:
+def btts_walk_forward(
+    points: list[BacktestPoint], folds: int = 4,
+    fold_base_parameters: list[dict[str, float]] | None = None,
+) -> dict[str, Any]:
     if len(points) < 400:
         return {"status": "INSUFFICIENT", "folds": 0, "points": len(points)}
     initial_train = len(points) // 2
@@ -231,7 +234,11 @@ def btts_walk_forward(points: list[BacktestPoint], folds: int = 4) -> dict[str, 
         start = initial_train + index * block
         end = len(points) if index == folds - 1 else min(start + block, len(points))
         train, test = points[:start], points[start:end]
-        base_params, _ = choose_parameters(train)
+        base_params = (
+            fold_base_parameters[index]
+            if fold_base_parameters and index < len(fold_base_parameters)
+            else choose_parameters(train)[0]
+        )
         params, _ = choose_btts_parameters(train, base_params)
         candidate = score_btts_points(test, base_params, params["history_k"], params["max_history_weight"])
         structural = score_btts_points(test, base_params, 1.0, 0.0)
@@ -688,6 +695,14 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
         legacy_v1_holdout = await asyncio.to_thread(score_points, holdout, -0.08, 6.0, 1.0)
         naive_holdout = await asyncio.to_thread(naive_baseline, train, holdout)
         bins = await asyncio.to_thread(calibration_bins, holdout, params["rho"], params["shrinkage"], params["recency"])
+        progress("WALK_FORWARD", 0, 1)
+        walk_forward = await asyncio.to_thread(walk_forward_report, all_points, 4)
+        progress("WALK_FORWARD", 1, 1)
+        fold_base_parameters = [
+            report["selected_parameters_on_fold_train"]
+            for report in walk_forward.get("reports", [])
+            if report.get("selected_parameters_on_fold_train")
+        ]
         progress("BTTS_PARAMETER_SEARCH", 0, 1)
         btts_params, btts_train = await asyncio.to_thread(choose_btts_parameters, train, params)
         btts_holdout = await asyncio.to_thread(
@@ -695,7 +710,7 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
         )
         btts_structural = await asyncio.to_thread(score_btts_points, holdout, params, 1.0, 0.0)
         btts_naive = float(naive_holdout["brier_btts"])
-        btts_walk = await asyncio.to_thread(btts_walk_forward, all_points, 4)
+        btts_walk = await asyncio.to_thread(btts_walk_forward, all_points, 4, fold_base_parameters)
         btts_report = {
             "status": "EVALUATED_NOT_PROMOTED",
             "parameters": btts_params,
@@ -724,10 +739,9 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
                 continue
             league_split = int(len(points) * 0.7)
             league_train, league_test = points[:league_split], points[league_split:]
-            league_params, _ = await asyncio.to_thread(choose_parameters, league_train)
             per_league[key] = {
-                "status": "EVALUATED", "parameters": league_params,
-                "holdout": await asyncio.to_thread(score_points, league_test, league_params["rho"], league_params["shrinkage"], league_params["recency"]),
+                "status": "EVALUATED_WITH_GLOBAL_REGULARIZED_PARAMETERS", "parameters": params,
+                "holdout": await asyncio.to_thread(score_points, league_test, params["rho"], params["shrinkage"], params["recency"]),
             }
 
         advanced = {}
@@ -746,9 +760,6 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             "btts_vs_legacy_brier_pct": improvement_percent(legacy_v1_holdout["brier_btts"], holdout_score["brier_btts"]),
             "btts_vs_naive_brier_pct": improvement_percent(naive_holdout["brier_btts"], holdout_score["brier_btts"]),
         }
-        progress("WALK_FORWARD", 0, 1)
-        walk_forward = await asyncio.to_thread(walk_forward_report, all_points, 4)
-        progress("WALK_FORWARD", 1, 1)
         promotion_candidate = (
             len(holdout) >= 500
             and params == V2_CANDIDATE

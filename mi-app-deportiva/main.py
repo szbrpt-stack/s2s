@@ -36,9 +36,9 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "7.2.1"
-CONTRACT_VERSION = "7.2"
-MODEL_VERSION = "hierarchical-dc-v7.2-boundary-audited-lineage"
+ENGINE_VERSION = "7.4.0"
+CONTRACT_VERSION = "7.4"
+MODEL_VERSION = "hierarchical-dc-v7.4-btts-walk-forward"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
@@ -63,6 +63,8 @@ SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "8")))
 DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "0.0")), 0.05))
 RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.2")), 1.0))
 ADVANCED_SHRINKAGE = {"corners": 12.0, "cards": 6.0, "shots": 12.0}
+BTTS_HISTORY_K = max(4.0, float(os.getenv("BTTS_HISTORY_K", "16")))
+BTTS_MAX_HISTORY_WEIGHT = max(0.0, min(float(os.getenv("BTTS_MAX_HISTORY_WEIGHT", "0.55")), 0.70))
 DEFAULT_DB_PATH = "/var/data/s2s_sigma_v5.db" if Path("/var/data").exists() else "/tmp/s2s_sigma_v5.db"
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", DEFAULT_DB_PATH)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -485,6 +487,15 @@ def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict
             "baseline_brier_over25": round((0.5 - (1.0 if actual_home + actual_away >= 3 else 0.0)) ** 2, 8),
             "actual_1x2": actual,
         }
+        btts_metric = ((snapshot.get("metrics") or {}).get("btts") or {})
+        probability_btts = as_float(btts_metric.get("probability_yes", btts_metric.get("probability")))
+        actual_btts = float(actual_home > 0 and actual_away > 0)
+        metrics.update({
+            "probability_btts": round(probability_btts, 8) if probability_btts is not None else None,
+            "brier_btts": round((probability_btts - actual_btts) ** 2, 8) if probability_btts is not None else None,
+            "baseline_brier_btts": round((0.5 - actual_btts) ** 2, 8),
+            "actual_btts": int(actual_btts),
+        })
         advanced_payload = advanced_actuals.get(int(shell["fixture_id"])) or {}
         team_blocks = advanced_payload.get("teams") if "teams" in advanced_payload else advanced_payload
         for metric_name, snapshot_key in (("corners", "corners_8_5"), ("cards", "cards_4_5"), ("shots", "shots_20_5")):
@@ -557,6 +568,8 @@ def db_model_scorecard() -> dict[str, Any]:
         baseline_brier = average("baseline_brier_1x2")
         over_brier = average("brier_over25")
         baseline_over = average("baseline_brier_over25")
+        btts_brier = average("brier_btts")
+        baseline_btts = average("baseline_brier_btts")
         advanced = {}
         for field in ("corners", "cards", "shots"):
             advanced_n = sum(row.get(f"{field}_brier") is not None for row in metric_rows)
@@ -573,6 +586,8 @@ def db_model_scorecard() -> dict[str, Any]:
             "baseline_brier_1x2": baseline_brier, "baseline_brier_over25": baseline_over,
             "brier_improvement_pct": round((baseline_brier - brier) / baseline_brier * 100, 4) if brier is not None and baseline_brier else None,
             "over25_brier_improvement_pct": round((baseline_over - over_brier) / baseline_over * 100, 4) if over_brier is not None and baseline_over else None,
+            "brier_btts": btts_brier, "baseline_brier_btts": baseline_btts,
+            "btts_brier_improvement_pct": round((baseline_btts - btts_brier) / baseline_btts * 100, 4) if btts_brier is not None and baseline_btts else None,
             "advanced": advanced,
         }
 
@@ -583,6 +598,9 @@ def db_model_scorecard() -> dict[str, Any]:
             if market == "over25":
                 probability = as_float(metric.get("probability_over25"))
                 actual = float(record["actual_home"] + record["actual_away"] >= 3) if probability is not None else None
+            elif market == "btts":
+                probability = as_float(metric.get("probability_btts"))
+                actual = float(record["actual_home"] > 0 and record["actual_away"] > 0) if probability is not None else None
             else:
                 probs = [as_float(prediction.get(key), 0.0) / 100 for key in ("p_home", "p_draw", "p_away")]
                 probability = max(probs)
@@ -613,6 +631,10 @@ def db_model_scorecard() -> dict[str, Any]:
                 "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
         "goals_2_5": {"eligible": n >= 300 and (overall.get("over25_brier_improvement_pct") or -999) > 0,
                       "requirements": {"minimum_n": 300, "positive_brier_improvement": True}},
+        "btts": {"eligible": n >= 300 and (overall.get("btts_brier_improvement_pct") or -999) > 0,
+                 "requirements": {"minimum_n": 300, "positive_brier_improvement": True},
+                 "current": {"n": n, "brier": overall.get("brier_btts"),
+                             "improvement_pct": overall.get("btts_brier_improvement_pct")}},
         **{
             field: {
                 "eligible": overall["advanced"][field]["n"] >= 100 and (overall["advanced"][field].get("brier_improvement_pct") or -999) > 0,
@@ -628,9 +650,11 @@ def db_model_scorecard() -> dict[str, Any]:
         "overall": overall, "horizons": horizons, "by_league": by_league,
         "calibration_bins_1x2": calibration_bins(records, "1x2"),
         "calibration_bins_over25": calibration_bins(records, "over25"),
+        "calibration_bins_btts": calibration_bins(records, "btts"),
         "promotion_gates": promotion,
         "log_loss_1x2": overall.get("log_loss_1x2"), "brier_1x2": overall.get("brier_1x2"),
         "accuracy_1x2": overall.get("accuracy_1x2"), "brier_over25": overall.get("brier_over25"),
+        "brier_btts": overall.get("brier_btts"),
         "modal_accuracy": round(sum(float(record["metrics"].get("modal_correct", 0)) for record in records) / n, 6),
         "warning": "Métrica prequential descriptiva; promoción nunca automática.",
     }
@@ -1143,6 +1167,56 @@ def btts_history(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     } for m in matches]
 
 
+def btts_evidence(matrix: list[list[float]], home: list[dict[str, Any]], away: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fuse the score distribution with independent, pre-kickoff BTTS history.
+
+    The Dixon-Coles matrix supplies the structural probability. A beta-binomial
+    empirical component can adjust it only in proportion to its sample size.
+    Large disagreement downgrades this market alone instead of contaminating 1X2.
+    """
+    model_probability = sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h])))
+    rows = [*home, *away]
+    hits = sum(match.get("gf", 0) > 0 and match.get("gc", 0) > 0 for match in rows)
+    sample = len(rows)
+    historical_frequency = hits / sample if sample else None
+    posterior_frequency = (hits + 2.0) / (sample + 4.0) if sample else model_probability
+    empirical_weight = min(sample / (sample + BTTS_HISTORY_K), BTTS_MAX_HISTORY_WEIGHT)
+    probability_yes = clamp(
+        model_probability * (1.0 - empirical_weight) + posterior_frequency * empirical_weight,
+        0.05, 0.95,
+    )
+    standard_error = math.sqrt(max(posterior_frequency * (1 - posterior_frequency), 0.01) / max(sample + 4, 1))
+    margin = min(0.35, 1.96 * standard_error)
+    interval = {
+        "low": round(clamp(probability_yes - margin, 0.0, 1.0), 4),
+        "high": round(clamp(probability_yes + margin, 0.0, 1.0), 4),
+    }
+    gap = abs(model_probability - historical_frequency) if historical_frequency is not None else None
+    coherence_limit = max(0.20, margin)
+    coherent = gap is not None and gap <= coherence_limit
+    status = "SUPPORTED" if sample >= 10 and coherent else "PARTIAL" if sample >= MIN_HISTORY * 2 else "UNAVAILABLE"
+    direction = "YES" if probability_yes >= 0.5 else "NO"
+    direction_probability = probability_yes if direction == "YES" else 1 - probability_yes
+    return {
+        "available": status == "SUPPORTED",
+        "status": status,
+        "direction": direction,
+        "probability": round(direction_probability, 6),
+        "probability_yes": round(probability_yes, 6),
+        "probability_no": round(1 - probability_yes, 6),
+        "model_probability": round(model_probability, 6),
+        "historical_frequency": round(historical_frequency, 6) if historical_frequency is not None else None,
+        "posterior_frequency": round(posterior_frequency, 6),
+        "sample": sample,
+        "hits": hits,
+        "interval_95": interval,
+        "coherence_gap": round(gap, 6) if gap is not None else None,
+        "coherence_limit": round(coherence_limit, 6),
+        "validation_status": "PREQUENTIAL_MONITORING_NOT_CERTIFIED",
+        "method": "DIXON_COLES_PLUS_BETA_BINOMIAL_SHRINKAGE",
+    }
+
+
 def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metric: str, line: float) -> dict[str, Any]:
     home_values = [float(m[metric]) for m in home if m.get(metric) is not None]
     away_values = [float(m[metric]) for m in away if m.get(metric) is not None]
@@ -1292,6 +1366,7 @@ def base_shell(fixture: dict[str, Any]) -> dict[str, Any]:
         "confidence": None, "viability": None, "viability_status": "NOT_CERTIFIED",
         "market_coverage": {
             "goals": {"status": "UNAVAILABLE", "sample": 0},
+            "btts": {"status": "UNAVAILABLE", "sample": 0},
             "corners": {"status": "UNAVAILABLE", "sample": 0},
             "cards": {"status": "UNAVAILABLE", "sample": 0},
             "shots": {"status": "UNAVAILABLE", "sample": 0},
@@ -1418,7 +1493,7 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
                 "evidence_quality": quality, "data_quality": quality["score"],
                 "sample_size": len(home["matches"]) + len(away["matches"])}
     h2h = await head_to_head(client, shell["home_id"], shell["away_id"], cutoff)
-    btts = sum(matrix[h][a] for h in range(1, len(matrix)) for a in range(1, len(matrix[h])))
+    btts = btts_evidence(matrix, home["matches"], away["matches"])
     lineage_note = (
         f"Evidencia oficial multi-competición ajustada; penalización de linaje {quality['lineage_penalty']} puntos"
         if quality.get("lineage_penalty") else
@@ -1473,12 +1548,13 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "viability": None, "viability_status": "NOT_CERTIFIED",
         "market_coverage": {
             "goals": {"status": "SUPPORTED", "sample": len(goal_hist), "validation_status": MODEL_VALIDATION_STATUS},
+            "btts": {"status": btts["status"], "sample": btts["sample"], "validation_status": btts["validation_status"]},
             "corners": market_state(corners), "cards": market_state(cards), "shots": market_state(shots),
         },
         "metrics": {
             "goals_2_5": {"available": True, "direction": goals_direction, "line": goals_line, "probability": round(goals_probability, 6), "sample": len(home_goal_hist) + len(away_goal_hist)},
             "corners_8_5": corners, "cards_4_5": cards, "shots_20_5": shots,
-            "btts": {"available": True, "probability": round(btts, 6)},
+            "btts": btts,
         },
         "h2h": h2h,
         "mercado": f"TENDENCIA: {'MÁS DE' if goals_direction == 'OVER' else 'MENOS DE'} 2.5 GOLES",
@@ -1497,7 +1573,15 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "corners_label": metric_label("CÓRNERS", corners), "corners_conf": round(corners.get("frequency", 0) * 100), "corners_proyeccion": advanced_projection(corners),
         "tarjetas_label": metric_label("TARJETAS", cards), "tarjetas_conf": round(cards.get("frequency", 0) * 100), "tarjetas_proyeccion": advanced_projection(cards),
         "disparos_label": metric_label("REMATES", shots), "disparos_conf": round(shots.get("frequency", 0) * 100), "disparos_proyeccion": advanced_projection(shots),
-        "btts_conf": round(btts * 100), "btts_proyeccion": f"{lambda_home:.2f} - {lambda_away:.2f}",
+        "btts_label": (
+            f"AMBOS MARCAN: {'SÍ' if btts['direction'] == 'YES' else 'NO'} · {btts['status']}"
+        ),
+        "btts_conf": round(btts["probability"] * 100),
+        "btts_proyeccion": (
+            f"SÍ {btts['probability_yes'] * 100:.0f}% · NO {btts['probability_no'] * 100:.0f}%|"
+            f"n={btts['sample']} · histórico {(btts['historical_frequency'] or 0) * 100:.0f}%|"
+            f"IC95 {btts['interval_95']['low'] * 100:.0f}–{btts['interval_95']['high'] * 100:.0f}%"
+        ),
         "cr_home_l10": "N/D", "cr_away_l10": "N/D", "cr_combinado_l10": "N/D",
         "metrics_home": {
             "gf_prom": round(float(home["gf_total"] or 0.0), 2),

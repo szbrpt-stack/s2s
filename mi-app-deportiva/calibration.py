@@ -32,6 +32,13 @@ ADVANCED_LINES = {"corners": 8.5, "cards": 4.5, "shots": 20.5}
 ADVANCED_SHRINKAGE_GRID = (6.0, 12.0, 20.0)
 BTTS_HISTORY_K_GRID = (8.0, 12.0, 16.0, 24.0)
 BTTS_MAX_WEIGHT_GRID = (0.35, 0.45, 0.55)
+FOLD_PARAMETER_CANDIDATES = (
+    {"rho": 0.0, "shrinkage": 8.0, "recency": 0.20},
+    {"rho": -0.05, "shrinkage": 12.0, "recency": 0.0},
+    {"rho": -0.08, "shrinkage": 6.0, "recency": 0.10},
+    {"rho": -0.05, "shrinkage": 8.0, "recency": 0.20},
+    {"rho": 0.0, "shrinkage": 12.0, "recency": 0.10},
+)
 CALL_BUDGET = max(100, min(int(os.getenv("CALIBRATION_CALL_BUDGET", "5000")), 20_000))
 V2_CANDIDATE = {"rho": -0.05, "shrinkage": 12.0, "recency": 0.0}
 
@@ -183,20 +190,41 @@ def predict_btts_fused(
             "sample": sample, "hits": hits, "history_weight": weight}
 
 
+def precompute_btts(
+    points: list[BacktestPoint], base_params: dict[str, float],
+) -> list[tuple[float, float, int, float]]:
+    """Compute the expensive structural matrix once per point for a parameter set."""
+    rows: list[tuple[float, float, int, float]] = []
+    for point in points:
+        structural = float(predict(
+            point, base_params["rho"], base_params["shrinkage"], base_params["recency"]
+        )["btts"])
+        paired = [
+            *(zip(point.home_home_for, point.home_home_against)),
+            *(zip(point.away_away_for, point.away_away_against)),
+        ]
+        sample = len(paired)
+        hits = sum(for_goals > 0 and against_goals > 0 for for_goals, against_goals in paired)
+        posterior = (hits + 2.0) / (sample + 4.0) if sample else structural
+        actual = float(point.home_goals > 0 and point.away_goals > 0)
+        rows.append((structural, posterior, sample, actual))
+    return rows
+
+
 def score_btts_points(
     points: list[BacktestPoint], base_params: dict[str, float], history_k: float, max_history_weight: float,
+    precomputed: list[tuple[float, float, int, float]] | None = None,
 ) -> dict[str, Any]:
     if not points:
         return {"n": 0, "brier": None, "log_loss": None}
     brier = log_loss = 0.0
     bins: defaultdict[int, list[tuple[float, float]]] = defaultdict(list)
-    for point in points:
-        result = predict_btts_fused(
-            point, base_params["rho"], base_params["shrinkage"], base_params["recency"],
-            history_k, max_history_weight,
-        )
-        probability = float(result["probability"])
-        actual = float(point.home_goals > 0 and point.away_goals > 0)
+    rows = precomputed if precomputed is not None else precompute_btts(points, base_params)
+    if len(rows) != len(points):
+        raise ValueError("BTTS precomputation length does not match points")
+    for structural, posterior, sample, actual in rows:
+        weight = min(sample / (sample + history_k), max_history_weight)
+        probability = clamp(structural * (1 - weight) + posterior * weight, 0.05, 0.95)
         brier += (probability - actual) ** 2
         log_loss -= actual * math.log(max(probability, EPS)) + (1 - actual) * math.log(max(1 - probability, EPS))
         bins[min(int(probability * 10), 9)].append((probability, actual))
@@ -213,9 +241,10 @@ def score_btts_points(
 
 def choose_btts_parameters(points: list[BacktestPoint], base_params: dict[str, float]) -> tuple[dict[str, float], dict[str, Any]]:
     candidates = []
+    precomputed = precompute_btts(points, base_params)
     for history_k in BTTS_HISTORY_K_GRID:
         for max_weight in BTTS_MAX_WEIGHT_GRID:
-            score = score_btts_points(points, base_params, history_k, max_weight)
+            score = score_btts_points(points, base_params, history_k, max_weight, precomputed)
             candidates.append((float(score["brier"]), float(score["log_loss"]), history_k, max_weight, score))
     _, _, history_k, max_weight, score = min(candidates)
     return {"history_k": history_k, "max_history_weight": max_weight}, score
@@ -240,8 +269,11 @@ def btts_walk_forward(
             else choose_parameters(train)[0]
         )
         params, _ = choose_btts_parameters(train, base_params)
-        candidate = score_btts_points(test, base_params, params["history_k"], params["max_history_weight"])
-        structural = score_btts_points(test, base_params, 1.0, 0.0)
+        test_precomputed = precompute_btts(test, base_params)
+        candidate = score_btts_points(
+            test, base_params, params["history_k"], params["max_history_weight"], test_precomputed
+        )
+        structural = score_btts_points(test, base_params, 1.0, 0.0, test_precomputed)
         naive = naive_baseline(train, test)
         naive_brier = float(naive["brier_btts"])
         improvement = {
@@ -409,6 +441,16 @@ def choose_parameters(train: list[BacktestPoint]) -> tuple[dict[str, float], dic
     return best_params, best_score or {}
 
 
+def choose_fold_parameters(train: list[BacktestPoint]) -> tuple[dict[str, float], dict[str, Any]]:
+    """Select fold parameters on fold-train only, from an audited compact grid."""
+    scored = []
+    for params in FOLD_PARAMETER_CANDIDATES:
+        result = score_points(train, params["rho"], params["shrinkage"], params["recency"])
+        scored.append((float(result["log_loss"]), float(result["brier_1x2"]), params, result))
+    _, _, params, result = min(scored, key=lambda row: (row[0], row[1]))
+    return dict(params), result
+
+
 def improvement_percent(reference: float, candidate: float) -> float:
     return round(100 * (reference - candidate) / reference, 4) if reference else 0.0
 
@@ -426,7 +468,7 @@ def walk_forward_report(points: list[BacktestPoint], folds: int = 4) -> dict[str
         train, test = points[:test_start], points[test_start:test_end]
         if len(test) < 30:
             continue
-        selected_params, _ = choose_parameters(train)
+        selected_params, _ = choose_fold_parameters(train)
         candidate = score_points(test, V2_CANDIDATE["rho"], V2_CANDIDATE["shrinkage"], V2_CANDIDATE["recency"])
         legacy = score_points(test, -0.08, 6.0, 1.0)
         naive = naive_baseline(train, test)

@@ -36,9 +36,9 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "8.0.0"
-CONTRACT_VERSION = "8.0"
-MODEL_VERSION = "hierarchical-dc-v8-evidence-suite"
+ENGINE_VERSION = "8.1.0"
+CONTRACT_VERSION = "8.1"
+MODEL_VERSION = "hierarchical-dc-v8.1-independent-market-quality"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
@@ -1299,6 +1299,12 @@ def metric_evidence(home: list[dict[str, Any]], away: list[dict[str, Any]], metr
 
 
 def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[str, Any], advanced_ratio: float) -> dict[str, Any]:
+    """Quality of the core goal model; advanced coverage is reported, never mixed.
+
+    Missing corners/cards/shots must not suppress an otherwise valid 1X2,
+    goals or BTTS distribution. Each advanced market owns its availability,
+    sample and validation status in ``metric_evidence``.
+    """
     history_n = min(len(home["matches"]), len(away["matches"]))
     season_n = min(home["played_total"], away["played_total"])
     history_score = min(history_n / HISTORY_SIZE, 1.0)
@@ -1311,12 +1317,15 @@ def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[st
     historical_share = clamp(float(league.get("historical_share") or 0.0), 0.0, 1.0)
     league_lineage_penalty = round(6 * historical_share)
     lineage_penalty = team_lineage_penalty + league_lineage_penalty
-    score = max(0, round(100 * (0.35 * history_score + 0.35 * season_score + 0.20 * league_score + 0.10 * advanced_ratio)) - lineage_penalty)
+    score = max(0, round(100 * (0.40 * history_score + 0.35 * season_score + 0.25 * league_score)) - lineage_penalty)
     label = "HIGH" if score >= 80 else "MODERATE" if score >= 60 else "LIMITED" if score >= 40 else "INSUFFICIENT"
     return {
         "score": score, "label": label, "history_per_team": history_n,
         "season_matches_min": season_n, "league_matches": int(league.get("sample") or 0),
+        "core_score": score,
         "advanced_coverage": round(advanced_ratio, 3),
+        "advanced_score": round(advanced_ratio * 100),
+        "quality_policy": "CORE_INDEPENDENT_FROM_ADVANCED_MARKETS",
         "lineage_penalty": lineage_penalty,
         "team_lineage_penalty": team_lineage_penalty,
         "league_lineage_penalty": league_lineage_penalty,

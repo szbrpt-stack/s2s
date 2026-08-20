@@ -1,4 +1,4 @@
-"""S2S Sigma Engine v7.
+"""S2S Sigma Engine v8.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -36,9 +36,9 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "7.4.2"
-CONTRACT_VERSION = "7.4"
-MODEL_VERSION = "hierarchical-dc-v7.4-btts-walk-forward"
+ENGINE_VERSION = "8.0.0"
+CONTRACT_VERSION = "8.0"
+MODEL_VERSION = "hierarchical-dc-v8-evidence-suite"
 MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
@@ -1494,6 +1494,19 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
                 "sample_size": len(home["matches"]) + len(away["matches"])}
     h2h = await head_to_head(client, shell["home_id"], shell["away_id"], cutoff)
     btts = btts_evidence(matrix, home["matches"], away["matches"])
+    goal_lines = {
+        f"over_{str(line).replace('.', '_')}": round(sum(
+            matrix[h][a] for h in range(len(matrix)) for a in range(len(matrix[h]))
+            if h + a > line
+        ), 6)
+        for line in (0.5, 1.5, 2.5, 3.5)
+    }
+    home_scores = 1.0 - sum(matrix[0][a] for a in range(len(matrix[0])))
+    away_scores = 1.0 - sum(matrix[h][0] for h in range(len(matrix)))
+    clean_sheet_home = 1.0 - away_scores
+    clean_sheet_away = 1.0 - home_scores
+    outcome_entropy = -sum(probability * math.log(max(probability, 1e-12)) for probability in (p_home, p_draw, p_away))
+    normalized_entropy = outcome_entropy / math.log(3.0)
     lineage_note = (
         f"Evidencia oficial multi-competición ajustada; penalización de linaje {quality['lineage_penalty']} puntos"
         if quality.get("lineage_penalty") else
@@ -1539,6 +1552,13 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         "expected_goals": {"home": round(lambda_home, 4), "away": round(lambda_away, 4), "total": round(lambda_home + lambda_away, 4)},
         "marcador_estimado": f"{modal[1]} - {modal[2]}",
         "scoreline_top": [{"score": f"{h} - {a}", "probability": round(prob, 6)} for prob, h, a in top],
+        "probability_suite": {
+            "goal_lines": goal_lines,
+            "team_to_score": {"home": round(home_scores, 6), "away": round(away_scores, 6)},
+            "clean_sheet": {"home": round(clean_sheet_home, 6), "away": round(clean_sheet_away, 6)},
+            "outcome_entropy": round(normalized_entropy, 6),
+            "separation": round(max(p_home, p_draw, p_away) - sorted((p_home, p_draw, p_away))[-2], 6),
+        },
         "evidence_quality": quality, "data_quality": quality["score"],
         "sample_size": len(home["matches"]) + len(away["matches"]),
         "confidence": {
@@ -1901,6 +1921,7 @@ async def calibration_status() -> dict[str, Any]:
             "naive_holdout": latest.get("naive_holdout"),
             "improvement": latest.get("improvement"),
             "walk_forward": latest.get("walk_forward"),
+            "btts": latest.get("btts"),
             "expected_calibration_error": latest.get("expected_calibration_error"),
             "promotion_candidate": latest.get("promotion_candidate", False),
             "promotion_policy": latest.get("promotion_policy"),

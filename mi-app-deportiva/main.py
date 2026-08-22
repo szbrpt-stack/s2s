@@ -49,6 +49,7 @@ REQUESTS_PER_MINUTE = max(60, min(int(os.getenv("REQUESTS_PER_MINUTE", "360")), 
 HTTP_CONCURRENCY = max(2, min(int(os.getenv("HTTP_CONCURRENCY", "12")), 20))
 ANALYSIS_WORKERS = max(1, min(int(os.getenv("ANALYSIS_WORKERS", "8")), 12))
 CATALOG_TTL = max(30, int(os.getenv("CATALOG_TTL_SECONDS", "60")))
+FUTURE_CATALOG_TTL = max(900, int(os.getenv("FUTURE_CATALOG_TTL_SECONDS", "21600")))
 TEAM_TTL = max(900, int(os.getenv("TEAM_TTL_SECONDS", "21600")))
 LEAGUE_TTL = max(900, int(os.getenv("LEAGUE_TTL_SECONDS", "21600")))
 FIXTURE_STATS_TTL = max(3600, int(os.getenv("FIXTURE_STATS_TTL_SECONDS", "86400")))
@@ -2088,7 +2089,11 @@ async def analyze_catalog(
                 progress_state["done"] += 1
                 progress_state["overall_done"] += 1.0
 
-        await asyncio.gather(*(warm(fixture) for fixture in candidates))
+        # Bound task creation as well as HTTP concurrency. Global future slates
+        # can exceed a thousand fixtures on weekends; scheduling every warm-up
+        # coroutine at once starves the free web instance's request loop.
+        for batch in chunks(candidates, ANALYSIS_WORKERS):
+            await asyncio.gather(*(warm(fixture) for fixture in batch))
         await preload_fixture_stats(client, historical_ids, overall_weight=float(len(candidates)), progress=progress_state)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         for fixture in candidates:
@@ -2160,10 +2165,13 @@ async def load_catalog(fixture_date: str, force: bool = False) -> None:
 async def load_future_catalog(fixture_date: str, force: bool = False) -> None:
     """Prepare a future day without replacing today's live global catalog."""
     async with _future_lock:
+        active_task = _future_tasks.get(fixture_date)
         fresh = (
             bool(_future_catalogs.get(fixture_date)) and
-            time.monotonic() - _future_loaded_at.get(fixture_date, 0.0) < CATALOG_TTL
+            time.monotonic() - _future_loaded_at.get(fixture_date, 0.0) < FUTURE_CATALOG_TTL
         )
+        if active_task is not None and not active_task.done() and _future_catalogs.get(fixture_date) and not force:
+            return
         if not fresh or force:
             timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
             async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:

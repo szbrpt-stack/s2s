@@ -307,6 +307,25 @@ def db_load_snapshots(fixture_date: str) -> dict[str, dict[str, Any]]:
     return result
 
 
+def db_load_resolved_scores(fixture_ids: list[str]) -> dict[str, tuple[int, int]]:
+    if not fixture_ids:
+        return {}
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            rows = db.execute(
+                "SELECT fixture_id,actual_home,actual_away FROM prediction_outcomes WHERE fixture_id=ANY(%s)",
+                ([str(item) for item in fixture_ids],),
+            ).fetchall()
+    else:
+        placeholders = ",".join("?" for _ in fixture_ids)
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            rows = db.execute(
+                f"SELECT fixture_id,actual_home,actual_away FROM prediction_outcomes WHERE fixture_id IN ({placeholders})",
+                fixture_ids,
+            ).fetchall()
+    return {str(fixture_id): (int(home), int(away)) for fixture_id, home, away in rows}
+
+
 def db_save_snapshot(fixture_date: str, fixture_id: str, cutoff: str, payload: dict[str, Any]) -> None:
     values = (fixture_id, fixture_date, cutoff, MODEL_VERSION,
               json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -1951,10 +1970,23 @@ def merged_props() -> list[dict[str, Any]]:
 def stored_props_for_date(fixture_date: str) -> list[dict[str, Any]]:
     """Return durable historical decisions without mutating today's live catalog."""
     snapshots = db_load_snapshots(fixture_date)
-    rows = [
-        {key: value for key, value in row.items() if not key.startswith("_")}
-        for row in snapshots.values()
-    ]
+    scores = db_load_resolved_scores(list(snapshots))
+    rows = []
+    for fixture_id, snapshot in snapshots.items():
+        row = {key: value for key, value in snapshot.items() if not key.startswith("_")}
+        score = scores.get(fixture_id)
+        row.update({
+            "is_live": False, "is_upcoming": False,
+            "is_finished": score is not None,
+            "official_status": "FT" if score else "HIST",
+            "interpreted_status": "FINISHED" if score else "HISTORICAL",
+            "status_group": "FINISHED" if score else "HISTORICAL",
+            "status_code": "FT" if score else "HIST",
+            "status_display": "FINALIZADO" if score else "REGISTRO HISTÓRICO",
+        })
+        if score:
+            row["score_real"] = f"{score[0]} - {score[1]}"
+        rows.append(row)
     rows.sort(key=lambda row: (
         row.get("kickoff_local") or row.get("fecha") or "",
         row.get("league_name") or row.get("liga") or "",

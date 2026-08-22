@@ -36,10 +36,10 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "8.1.0"
-CONTRACT_VERSION = "8.1"
-MODEL_VERSION = "hierarchical-dc-v8.1-independent-market-quality"
-MODEL_VALIDATION_STATUS = "WALK_FORWARD_EVALUATED_CONFIGURATION_NOT_EXTERNALLY_CERTIFIED"
+ENGINE_VERSION = "8.5.0"
+CONTRACT_VERSION = "8.5"
+MODEL_VERSION = "hierarchical-dc-v8.5-stable-champion"
+MODEL_VALIDATION_STATUS = "CHAMPION_RETAINED_CHALLENGER_EVALUATED_NOT_PROMOTED"
 BASE_URL = "https://v3.football.api-sports.io"
 BOGOTA = ZoneInfo("America/Bogota")
 UTC = timezone.utc
@@ -59,6 +59,8 @@ MIN_SEASON_PLAYED = max(3, int(os.getenv("MIN_SEASON_PLAYED", "5")))
 MIN_EVIDENCE_QUALITY = max(0, min(int(os.getenv("MIN_EVIDENCE_QUALITY", "55")), 100))
 MAX_GOALS_HISTORY_GAP = max(0.10, min(float(os.getenv("MAX_GOALS_HISTORY_GAP", "0.30")), 0.50))
 STALE_NS_MINUTES = max(5, int(os.getenv("STALE_NS_MINUTES", "15")))
+# Keep the production champion until a challenger passes every walk-forward
+# stability gate. Environment overrides remain available for controlled tests.
 SHRINKAGE_MATCHES = max(3.0, float(os.getenv("SHRINKAGE_MATCHES", "8")))
 DIXON_COLES_RHO = max(-0.20, min(float(os.getenv("DIXON_COLES_RHO", "0.0")), 0.05))
 RECENCY_STRENGTH = max(0.0, min(float(os.getenv("RECENCY_STRENGTH", "0.2")), 1.0))
@@ -512,6 +514,25 @@ def db_resolve_outcomes(catalog: list[dict[str, Any]], snapshots: dict[str, dict
                 round((probability_over - float(observed_total > line)) ** 2, 8)
                 if probability_over is not None and observed_total is not None and line is not None else None
             )
+        primary = snapshot.get("primary_pick") or {}
+        primary_correct: int | None = None
+        if primary.get("status") == "SELECTED":
+            market, selection = primary.get("market"), primary.get("selection")
+            if market == "1x2":
+                primary_correct = int(selection == ("HOME" if actual == 0 else "DRAW" if actual == 1 else "AWAY"))
+            elif market == "goals_2_5":
+                primary_correct = int((actual_home + actual_away >= 3) == (selection == "OVER"))
+            elif market == "btts":
+                primary_correct = int((actual_home > 0 and actual_away > 0) == (selection == "YES"))
+            elif market in {"corners", "cards", "shots"}:
+                actual_value = as_float(metrics.get(f"{market}_actual"))
+                metric_key = {"corners": "corners_8_5", "cards": "cards_4_5", "shots": "shots_20_5"}[market]
+                primary_evidence = (snapshot.get("metrics") or {}).get(metric_key) or {}
+                line = as_float(primary_evidence.get("line"))
+                if actual_value is not None and line is not None:
+                    primary_correct = int((actual_value > line) == (selection == "OVER"))
+        metrics.update({"primary_market": primary.get("market"), "primary_selection": primary.get("selection"),
+                        "primary_correct": primary_correct})
         values.append((
             shell["fixture_id"], shell.get("kickoff_utc"), snapshot.get("model_version") or MODEL_VERSION,
             json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), actual_home, actual_away,
@@ -658,6 +679,155 @@ def db_model_scorecard() -> dict[str, Any]:
         "modal_accuracy": round(sum(float(record["metrics"].get("modal_correct", 0)) for record in records) / n, 6),
         "warning": "Métrica prequential descriptiva; promoción nunca automática.",
     }
+
+
+def _wilson_interval(wins: int, total: int, z: float = 1.959963984540054) -> list[float] | None:
+    """95% Wilson interval; remains useful with the small daily samples we expect."""
+    if total <= 0:
+        return None
+    rate = wins / total
+    denominator = 1 + z * z / total
+    centre = (rate + z * z / (2 * total)) / denominator
+    margin = z * math.sqrt((rate * (1 - rate) + z * z / (4 * total)) / total) / denominator
+    return [round(max(0.0, centre - margin), 4), round(min(1.0, centre + margin), 4)]
+
+
+def _market_verdicts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve only predictions that were actually available before kickoff."""
+    prediction, metrics = record["prediction"], record["metrics"]
+    actual_home, actual_away = record["actual_home"], record["actual_away"]
+    results: list[dict[str, Any]] = []
+
+    probabilities = [as_float(prediction.get(key), 0.0) / 100 for key in ("p_home", "p_draw", "p_away")]
+    if sum(probabilities) > 0:
+        predicted = max(range(3), key=lambda index: probabilities[index])
+        actual = 0 if actual_home > actual_away else 1 if actual_home == actual_away else 2
+        results.append({"market": "1x2", "won": predicted == actual, "confidence": max(probabilities)})
+
+    evidence = prediction.get("metrics") or {}
+    goals = evidence.get("goals_2_5") or {}
+    goals_probability = as_float(goals.get("probability"))
+    goals_direction = str(goals.get("direction") or "").upper()
+    if goals_probability is not None and goals_direction in {"OVER", "UNDER"}:
+        actual_over = actual_home + actual_away >= 3
+        results.append({"market": "goals_2_5", "won": actual_over == (goals_direction == "OVER"), "confidence": goals_probability})
+
+    btts = evidence.get("btts") or {}
+    btts_probability = as_float(btts.get("probability_yes", btts.get("probability")))
+    if btts_probability is not None:
+        actual_yes = actual_home > 0 and actual_away > 0
+        results.append({"market": "btts", "won": actual_yes == (btts_probability >= 0.5),
+                        "confidence": max(btts_probability, 1 - btts_probability)})
+
+    for market, key in (("corners", "corners_8_5"), ("cards", "cards_4_5"), ("shots", "shots_20_5")):
+        item = evidence.get(key) or {}
+        probability_over = as_float(item.get("probability_over"))
+        line = as_float(item.get("line"))
+        actual_value = as_float(metrics.get(f"{market}_actual"))
+        if probability_over is not None and line is not None and actual_value is not None:
+            predicted_over = probability_over >= 0.5
+            results.append({"market": market, "won": (actual_value > line) == predicted_over,
+                            "confidence": max(probability_over, 1 - probability_over)})
+    return results
+
+
+def db_daily_performance(date_from: str | None = None, date_to: str | None = None) -> dict[str, Any]:
+    query = "SELECT fixture_id,kickoff_utc,prediction,metrics,actual_home,actual_away FROM prediction_outcomes ORDER BY kickoff_utc DESC LIMIT 5000"
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+            rows = db.execute(query).fetchall()
+    else:
+        with closing(sqlite3.connect(STATE_DB_PATH)) as db:
+            rows = db.execute(query).fetchall()
+
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            kickoff = parse_dt(row[1])
+            if kickoff is None:
+                continue
+            local_day = kickoff.astimezone(BOGOTA).date().isoformat()
+            if (date_from and local_day < date_from) or (date_to and local_day > date_to):
+                continue
+            parsed.append({"fixture_id": str(row[0]), "date": local_day, "kickoff": row[1],
+                           "prediction": json.loads(row[2]), "metrics": json.loads(row[3]),
+                           "actual_home": int(row[4]), "actual_away": int(row[5])})
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+    def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
+        counters: dict[str, dict[str, Any]] = defaultdict(lambda: {"wins": 0, "losses": 0, "confidence": []})
+        for record in records:
+            for verdict in _market_verdicts(record):
+                bucket = counters[verdict["market"]]
+                bucket["wins" if verdict["won"] else "losses"] += 1
+                bucket["confidence"].append(float(verdict["confidence"]))
+        markets: dict[str, Any] = {}
+        for market, bucket in counters.items():
+            total = bucket["wins"] + bucket["losses"]
+            markets[market] = {"wins": bucket["wins"], "losses": bucket["losses"], "total": total,
+                               "winrate": round(bucket["wins"] / total, 4),
+                               "confidence_interval_95": _wilson_interval(bucket["wins"], total),
+                               "mean_model_confidence": round(sum(bucket["confidence"]) / total, 4)}
+        all_wins = sum(item["wins"] for item in markets.values())
+        all_total = sum(item["total"] for item in markets.values())
+        primary_rows = [record["metrics"] for record in records if record["metrics"].get("primary_correct") is not None]
+        primary_wins = sum(int(row["primary_correct"]) for row in primary_rows)
+        primary_total = len(primary_rows)
+        primary_markets: dict[str, dict[str, int]] = defaultdict(lambda: {"wins": 0, "total": 0})
+        for row in primary_rows:
+            market = str(row.get("primary_market") or "unknown")
+            primary_markets[market]["total"] += 1
+            primary_markets[market]["wins"] += int(row["primary_correct"])
+        return {"fixtures": len(records), "evaluated_picks": all_total, "wins": all_wins,
+                "losses": all_total - all_wins,
+                "winrate": round(all_wins / all_total, 4) if all_total else None,
+                "confidence_interval_95": _wilson_interval(all_wins, all_total), "markets": markets,
+                "primary": {"wins": primary_wins, "losses": primary_total - primary_wins, "total": primary_total,
+                            "winrate": round(primary_wins / primary_total, 4) if primary_total else None,
+                            "confidence_interval_95": _wilson_interval(primary_wins, primary_total),
+                            "markets": {market: {**values, "losses": values["total"] - values["wins"],
+                                                  "winrate": round(values["wins"] / values["total"], 4)}
+                                        for market, values in primary_markets.items()}}}
+
+    def confidence_segments(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        verdicts = [verdict for record in records for verdict in _market_verdicts(record)]
+        result = []
+        for threshold in (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80):
+            selected = [item for item in verdicts if item["confidence"] >= threshold]
+            wins = sum(bool(item["won"]) for item in selected)
+            total = len(selected)
+            result.append({"threshold": threshold, "wins": wins, "losses": total - wins, "total": total,
+                           "winrate": round(wins / total, 4) if total else None,
+                           "confidence_interval_95": _wilson_interval(wins, total)})
+        return result
+
+    def reliability_bins(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for record in records:
+            for verdict in _market_verdicts(record):
+                bucket = min(9, max(0, int(float(verdict["confidence"]) * 10)))
+                buckets[bucket].append(verdict)
+        return [{"from": bucket / 10, "to": (bucket + 1) / 10, "total": len(items),
+                 "mean_confidence": round(sum(float(item["confidence"]) for item in items) / len(items), 4),
+                 "observed_winrate": round(sum(bool(item["won"]) for item in items) / len(items), 4)}
+                for bucket, items in sorted(buckets.items())]
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    leagues: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in parsed:
+        grouped[record["date"]].append(record)
+        prediction = record["prediction"]
+        league = str(prediction.get("league_name") or prediction.get("liga") or "Sin liga")
+        leagues[league].append(record)
+    league_rows = [{"league": league, **aggregate(items)} for league, items in leagues.items()]
+    league_rows.sort(key=lambda item: item["evaluated_picks"], reverse=True)
+    return {"status": "READY" if parsed else "INSUFFICIENT", "timezone": str(BOGOTA),
+            "methodology": "Prequential: solo snapshots READY creados antes del inicio; cada mercado evaluable cuenta como un pick.",
+            "roi_status": "UNAVAILABLE_WITHOUT_HISTORICAL_ODDS", "overall": aggregate(parsed),
+            "confidence_segments": confidence_segments(parsed), "reliability_bins": reliability_bins(parsed),
+            "by_league": league_rows[:30],
+            "daily": [{"date": day, **aggregate(grouped[day])} for day in sorted(grouped, reverse=True)]}
 
 
 init_db()
@@ -1338,6 +1508,101 @@ def evidence_quality(home: dict[str, Any], away: dict[str, Any], league: dict[st
     }
 
 
+def sigma_assessment(
+    quality: dict[str, Any], sample_size: int, coherence_gap: float, coherence_limit: float,
+    entropy: float, separation: float, markets: dict[str, dict[str, Any]], lineage_note: str,
+) -> dict[str, Any]:
+    """Evidence-strength index, deliberately distinct from event probability."""
+    data_component = clamp(float(quality.get("score", 0)), 0, 100) * 0.45
+    sample_component = min(sample_size / 40, 1.0) * 10
+    coherence_component = max(0.0, 1.0 - coherence_gap / max(coherence_limit, 1e-9)) * 20
+    uncertainty_component = (1.0 - clamp(entropy, 0, 1)) * 10 + clamp(separation / 0.35, 0, 1) * 5
+    supported = sum(bool(item.get("available")) for item in markets.values())
+    coverage_component = supported / max(len(markets), 1) * 10
+    score = round(clamp(data_component + sample_component + coherence_component + uncertainty_component + coverage_component, 0, 100))
+    grade = "SÓLIDA" if score >= 80 else "MODERADA" if score >= 65 else "LIMITADA"
+    strengths = [f"Calidad de datos {int(quality.get('score', 0))}/100", f"Muestra de {sample_size} registros"]
+    risks: list[str] = []
+    if coherence_gap <= coherence_limit * 0.5:
+        strengths.append("Modelo e historial muestran buena coherencia")
+    else:
+        risks.append("Modelo e historial presentan una diferencia relevante")
+    if supported >= 3:
+        strengths.append(f"{supported} mercados auxiliares con cobertura")
+    else:
+        risks.append("Cobertura limitada en mercados auxiliares")
+    if entropy >= 0.90:
+        risks.append("El resultado 1X2 tiene alta incertidumbre")
+    if separation < 0.08:
+        risks.append("Las dos salidas 1X2 principales están muy próximas")
+    if quality.get("lineage_penalty"):
+        risks.append(lineage_note)
+    if sample_size < 20:
+        risks.append("Muestra histórica reducida")
+    if not risks:
+        risks.append("El fútbol conserva variabilidad no explicada por el modelo")
+    return {"score": score, "grade": grade, "strengths": strengths[:4], "risks": risks[:4],
+            "components": {"data": round(data_component, 2), "sample": round(sample_component, 2),
+                           "coherence": round(coherence_component, 2), "uncertainty": round(uncertainty_component, 2),
+                           "coverage": round(coverage_component, 2)}}
+
+
+def select_primary_pick(
+    sigma_score: int, probabilities: dict[str, float], separation: float,
+    goals: dict[str, Any], btts: dict[str, Any], advanced: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Choose at most one auditable pre-match signal. No pick is a valid outcome."""
+    reasons: list[str] = []
+    if sigma_score < 65:
+        return {"status": "ABSTAINED", "reason": f"Índice Sigma {sigma_score}/100 inferior al mínimo 65", "candidates": 0}
+    candidates: list[dict[str, Any]] = []
+
+    labels = ("LOCAL", "EMPATE", "VISITANTE")
+    one_x_two = [float(probabilities.get(key, 0.0)) for key in ("home", "draw", "away")]
+    best_index = max(range(3), key=lambda index: one_x_two[index])
+    if one_x_two[best_index] >= 0.50 and separation >= 0.08:
+        candidates.append({"market": "1x2", "selection": ("HOME", "DRAW", "AWAY")[best_index],
+                           "label": labels[best_index], "confidence": one_x_two[best_index], "sample": 0})
+    else:
+        reasons.append("1X2 sin confianza o separación suficiente")
+
+    goals_confidence = as_float(goals.get("probability"), 0.0) or 0.0
+    if goals.get("available") and goals_confidence >= 0.60 and int(goals.get("sample") or 0) >= 10:
+        direction = str(goals.get("direction") or "").upper()
+        candidates.append({"market": "goals_2_5", "selection": direction,
+                           "label": f"{'MÁS' if direction == 'OVER' else 'MENOS'} DE 2.5 GOLES",
+                           "confidence": goals_confidence, "sample": int(goals.get("sample") or 0)})
+
+    btts_confidence = as_float(btts.get("probability"), 0.0) or 0.0
+    if btts.get("status") == "SUPPORTED" and btts_confidence >= 0.60 and int(btts.get("sample") or 0) >= 10:
+        direction = str(btts.get("direction") or "").upper()
+        candidates.append({"market": "btts", "selection": direction,
+                           "label": f"AMBOS MARCAN: {'SÍ' if direction == 'YES' else 'NO'}",
+                           "confidence": btts_confidence, "sample": int(btts.get("sample") or 0)})
+
+    for market, evidence in advanced.items():
+        probability_over = as_float(evidence.get("probability_over"))
+        sample = int(evidence.get("sample") or 0)
+        line = as_float(evidence.get("line"))
+        if evidence.get("available") and probability_over is not None and line is not None and sample >= 10:
+            confidence = max(probability_over, 1 - probability_over)
+            if confidence >= 0.62:
+                direction = "OVER" if probability_over >= 0.5 else "UNDER"
+                noun = {"corners": "CÓRNERS", "cards": "TARJETAS", "shots": "REMATES"}[market]
+                candidates.append({"market": market, "selection": direction,
+                                   "label": f"{'MÁS' if direction == 'OVER' else 'MENOS'} DE {line:g} {noun}",
+                                   "confidence": confidence, "sample": sample})
+
+    if not candidates:
+        return {"status": "ABSTAINED", "reason": "; ".join(reasons) or "Ningún mercado supera los requisitos", "candidates": 0}
+    for candidate in candidates:
+        sample_strength = min(int(candidate["sample"]) / 30, 1.0)
+        candidate["selection_score"] = round(candidate["confidence"] * 0.55 + sigma_score / 100 * 0.30 + sample_strength * 0.15, 6)
+    winner = max(candidates, key=lambda item: (item["selection_score"], item["confidence"], item["sample"]))
+    return {"status": "SELECTED", **winner, "confidence": round(float(winner["confidence"]), 6),
+            "candidates": len(candidates), "policy_version": "primary-v1"}
+
+
 def base_shell(fixture: dict[str, Any]) -> dict[str, Any]:
     info, league, teams = fixture.get("fixture") or {}, fixture.get("league") or {}, fixture.get("teams") or {}
     home, away = teams.get("home") or {}, teams.get("away") or {}
@@ -1551,6 +1816,26 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
         status = "SUPPORTED" if evidence.get("available") else "PARTIAL" if sample > 0 else "UNAVAILABLE"
         return {"status": status, "sample": sample, "validation_status": evidence.get("validation_status")}
 
+    goals_evidence = {"available": True, "direction": goals_direction, "line": goals_line,
+                      "probability": round(goals_probability, 6), "sample": len(home_goal_hist) + len(away_goal_hist)}
+    sigma = sigma_assessment(
+        quality=quality,
+        sample_size=len(home["matches"]) + len(away["matches"]),
+        coherence_gap=coherence_gap,
+        coherence_limit=coherence_limit,
+        entropy=normalized_entropy,
+        separation=max(p_home, p_draw, p_away) - sorted((p_home, p_draw, p_away))[-2],
+        markets={"goals": {"available": True}, "btts": btts, "corners": corners, "cards": cards, "shots": shots},
+        lineage_note=lineage_note,
+    )
+    primary_pick = select_primary_pick(
+        sigma_score=sigma["score"],
+        probabilities={"home": p_home, "draw": p_draw, "away": p_away},
+        separation=max(p_home, p_draw, p_away) - sorted((p_home, p_draw, p_away))[-2],
+        goals=goals_evidence, btts=btts,
+        advanced={"corners": corners, "cards": cards, "shots": shots},
+    )
+
     snapshot = {
         **shell,
         "analysis_status": "READY", "analysis_message": lineage_note,
@@ -1569,6 +1854,10 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
             "separation": round(max(p_home, p_draw, p_away) - sorted((p_home, p_draw, p_away))[-2], 6),
         },
         "evidence_quality": quality, "data_quality": quality["score"],
+        "sigma_index": sigma,
+        "sigma_score": sigma["score"], "sigma_grade": sigma["grade"],
+        "supporting_factors": sigma["strengths"], "risk_factors": sigma["risks"],
+        "primary_pick": primary_pick,
         "sample_size": len(home["matches"]) + len(away["matches"]),
         "confidence": {
             "status": MODEL_VALIDATION_STATUS,
@@ -1581,7 +1870,7 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
             "corners": market_state(corners), "cards": market_state(cards), "shots": market_state(shots),
         },
         "metrics": {
-            "goals_2_5": {"available": True, "direction": goals_direction, "line": goals_line, "probability": round(goals_probability, 6), "sample": len(home_goal_hist) + len(away_goal_hist)},
+            "goals_2_5": goals_evidence,
             "corners_8_5": corners, "cards_4_5": cards, "shots_20_5": shots,
             "btts": btts,
         },
@@ -1933,6 +2222,7 @@ async def calibration_status() -> dict[str, Any]:
             "btts": latest.get("btts"),
             "expected_calibration_error": latest.get("expected_calibration_error"),
             "promotion_candidate": latest.get("promotion_candidate", False),
+            "promotion_review": latest.get("promotion_review"),
             "promotion_policy": latest.get("promotion_policy"),
         }
     return {"task": _calibration_state, "durable_job": durable_job, "latest": summary}
@@ -1942,6 +2232,16 @@ async def calibration_status() -> dict[str, Any]:
 async def model_scorecard() -> dict[str, Any]:
     """Seguimiento prequential: sólo predicciones selladas antes del kickoff."""
     return await asyncio.to_thread(db_model_scorecard)
+
+
+@app.get("/api/v1/performance/daily")
+async def daily_performance(
+    date_from: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> dict[str, Any]:
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from no puede ser posterior a date_to")
+    return await asyncio.to_thread(db_daily_performance, date_from, date_to)
 
 
 @app.post("/api/v1/calibration/run", status_code=202)

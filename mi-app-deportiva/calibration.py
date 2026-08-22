@@ -455,6 +455,34 @@ def improvement_percent(reference: float, candidate: float) -> float:
     return round(100 * (reference - candidate) / reference, 4) if reference else 0.0
 
 
+def promotion_review(
+    holdout_n: int,
+    parameters: dict[str, float],
+    improvement: dict[str, float],
+    walk_forward: dict[str, Any],
+    ece: float,
+) -> dict[str, Any]:
+    """Deterministic challenger gate. It recommends review but never mutates production."""
+    gates = {
+        "holdout_n_gte_500": holdout_n >= 500,
+        "audited_candidate": parameters == V2_CANDIDATE,
+        "legacy_log_loss_improvement_gt_1pct": improvement.get("vs_legacy_log_loss_pct", -999) > 1.0,
+        "legacy_brier_improvement_gt_1pct": improvement.get("vs_legacy_brier_pct", -999) > 1.0,
+        "naive_log_loss_improvement_positive": improvement.get("vs_naive_log_loss_pct", -999) > 0.0,
+        "naive_brier_improvement_positive": improvement.get("vs_naive_brier_pct", -999) > 0.0,
+        "walk_forward_stable": bool(walk_forward.get("stable_candidate")),
+        "ece_lte_5pct": ece <= 0.05,
+    }
+    failures = [name for name, passed in gates.items() if not passed]
+    return {
+        "decision": "READY_FOR_HUMAN_REVIEW" if not failures else "REJECTED",
+        "eligible": not failures,
+        "gates": gates,
+        "failed_gates": failures,
+        "automatic_promotion": False,
+    }
+
+
 def walk_forward_report(points: list[BacktestPoint], folds: int = 4) -> dict[str, Any]:
     """Repeated expanding-window validation with no future leakage."""
     if len(points) < 400 or folds < 2:
@@ -802,15 +830,9 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             "btts_vs_legacy_brier_pct": improvement_percent(legacy_v1_holdout["brier_btts"], holdout_score["brier_btts"]),
             "btts_vs_naive_brier_pct": improvement_percent(naive_holdout["brier_btts"], holdout_score["brier_btts"]),
         }
-        promotion_candidate = (
-            len(holdout) >= 500
-            and params == V2_CANDIDATE
-            and improvement["vs_legacy_log_loss_pct"] > 1.0
-            and improvement["vs_legacy_brier_pct"] > 1.0
-            and improvement["vs_naive_log_loss_pct"] > 0.0
-            and improvement["vs_naive_brier_pct"] > 0.0
-            and bool(walk_forward.get("stable_candidate"))
-        )
+        ece = expected_calibration_error(bins)
+        review = promotion_review(len(holdout), params, improvement, walk_forward, ece)
+        promotion_candidate = bool(review["eligible"])
 
         report = {
             "status": "EVALUATED_NOT_PROMOTED", "date": date,
@@ -819,8 +841,9 @@ async def run_calibration(date: str, max_leagues: int, include_advanced: bool) -
             "parameters": params, "train": train_score, "holdout": holdout_score,
             "legacy_v1_holdout": legacy_v1_holdout, "naive_holdout": naive_holdout,
             "improvement": improvement, "promotion_candidate": promotion_candidate,
+            "promotion_review": review,
             "walk_forward": walk_forward,
-            "calibration_bins": bins, "expected_calibration_error": expected_calibration_error(bins),
+            "calibration_bins": bins, "expected_calibration_error": ece,
             "per_league": per_league, "advanced": advanced, "provider_errors": errors,
             "btts": btts_report,
             "api_budget": {"configured_calls": CALL_BUDGET, "advanced_fixtures_requested": len(advanced_ids) if include_advanced else 0},

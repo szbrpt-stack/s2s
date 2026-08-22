@@ -36,7 +36,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "8.5.0"
+ENGINE_VERSION = "8.5.1"
 CONTRACT_VERSION = "8.5"
 MODEL_VERSION = "hierarchical-dc-v8.5-stable-champion"
 MODEL_VALIDATION_STATUS = "CHAMPION_RETAINED_CHALLENGER_EVALUATED_NOT_PROMOTED"
@@ -1948,6 +1948,36 @@ def merged_props() -> list[dict[str, Any]]:
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
 
 
+def stored_props_for_date(fixture_date: str) -> list[dict[str, Any]]:
+    """Return durable historical decisions without mutating today's live catalog."""
+    snapshots = db_load_snapshots(fixture_date)
+    rows = [
+        {key: value for key, value in row.items() if not key.startswith("_")}
+        for row in snapshots.values()
+    ]
+    rows.sort(key=lambda row: (
+        row.get("kickoff_local") or row.get("fecha") or "",
+        row.get("league_name") or row.get("liga") or "",
+        str(row.get("fixture_id") or row.get("id") or ""),
+    ))
+    return rows
+
+
+def stored_sync_payload(fixture_date: str, props: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: defaultdict[str, int] = defaultdict(int)
+    for row in props:
+        counts[str(row.get("analysis_status") or "UNAVAILABLE")] += 1
+    completed = counts["READY"] + counts["ABSTAINED"] + counts["ERROR"] + counts["UNAVAILABLE"]
+    return {
+        "contract_version": CONTRACT_VERSION, "date": fixture_date, "total": len(props),
+        "eligible": 0, "ready": counts["READY"], "abstained": counts["ABSTAINED"],
+        "pending": 0, "unavailable": counts["UNAVAILABLE"], "failed": counts["ERROR"],
+        "phase": "HISTORICAL_READ_ONLY", "phase_done": completed, "phase_total": max(len(props), 1),
+        "phase_progress": 1.0, "progress": 1.0, "running": False,
+        "started_at": None, "catalog_updated_at": datetime.now(UTC).isoformat(),
+    }
+
+
 def stamp_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     """Version every durable decision, including a scientifically valid abstention."""
     if result.get("analysis_status") not in {"READY", "ABSTAINED"}:
@@ -2280,6 +2310,9 @@ async def start_calibration(
 @app.get("/api/v1/sync")
 async def sync_status(date: str | None = Query(None)) -> dict[str, Any]:
     requested = date or now_local().strftime("%Y-%m-%d")
+    if requested != now_local().strftime("%Y-%m-%d"):
+        props = await asyncio.to_thread(stored_props_for_date, requested)
+        return stored_sync_payload(requested, props)
     try:
         await load_catalog(requested, False)
         return sync_payload()
@@ -2312,6 +2345,8 @@ async def get_props(
 ) -> list[dict[str, Any]]:
     del all
     requested = date or now_local().strftime("%Y-%m-%d")
+    if requested != now_local().strftime("%Y-%m-%d"):
+        return await asyncio.to_thread(stored_props_for_date, requested)
     try:
         await load_catalog(requested, refresh)
         return merged_props()

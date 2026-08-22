@@ -36,7 +36,7 @@ try:
 except ImportError:  # El desarrollo local puede continuar con SQLite.
     psycopg = None
 
-ENGINE_VERSION = "8.5.1"
+ENGINE_VERSION = "8.5.2"
 CONTRACT_VERSION = "8.5"
 MODEL_VERSION = "hierarchical-dc-v8.5-stable-champion"
 MODEL_VALIDATION_STATUS = "CHAMPION_RETAINED_CHALLENGER_EVALUATED_NOT_PROMOTED"
@@ -88,6 +88,13 @@ _catalog_discovery: dict[str, Any] = {}
 _analysis_task: asyncio.Task[None] | None = None
 _analysis_errors: dict[str, str] = {}
 _progress = {"phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0, "overall_total": 1.0, "started_at": None}
+_future_lock = asyncio.Lock()
+_future_catalogs: dict[str, list[dict[str, Any]]] = {}
+_future_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
+_future_errors: dict[str, dict[str, str]] = {}
+_future_progress: dict[str, dict[str, Any]] = {}
+_future_tasks: dict[str, asyncio.Task[None]] = {}
+_future_loaded_at: dict[str, float] = {}
 _quota = {"daily_remaining": None, "minute_remaining": None, "last_call_at": None}
 _calibration_task: asyncio.Task[None] | None = None
 _calibration_job_id: str | None = None
@@ -1039,7 +1046,11 @@ async def hydrate_finished_advanced(client: httpx.AsyncClient, catalog: list[dic
     return len(fetched)
 
 
-async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int], overall_weight: float = 0.0) -> None:
+async def preload_fixture_stats(
+    client: httpx.AsyncClient, fixture_ids: set[int], overall_weight: float = 0.0,
+    progress: dict[str, Any] | None = None,
+) -> None:
+    progress_state = progress if progress is not None else _progress
     stored = await asyncio.to_thread(db_load_advanced_stats, list(fixture_ids))
     for fixture_id, payload in stored.items():
         blocks = payload.get("teams") if isinstance(payload, dict) and "teams" in payload else payload
@@ -1048,7 +1059,7 @@ async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int]
     batches = chunks(missing, 20)
     if not batches:
         return
-    _progress.update(phase="HISTORICAL_STATS", done=0, total=len(batches))
+    progress_state.update(phase="HISTORICAL_STATS", done=0, total=len(batches))
     batch_weight = overall_weight / len(batches)
 
     fetched: dict[int, dict[str, Any]] = {}
@@ -1068,8 +1079,8 @@ async def preload_fixture_stats(client: httpx.AsyncClient, fixture_ids: set[int]
             for fixture_id in set(batch) - found:
                 cache_put(f"fixture-stats:{fixture_id}", {}, FIXTURE_STATS_TTL)
         finally:
-            _progress["done"] += 1
-            _progress["overall_done"] += batch_weight
+            progress_state["done"] += 1
+            progress_state["overall_done"] += batch_weight
 
     results = await asyncio.gather(*(load(batch) for batch in batches), return_exceptions=True)
     for result in results:
@@ -1938,11 +1949,13 @@ async def build_analysis(client: httpx.AsyncClient, fixture: dict[str, Any]) -> 
     return snapshot
 
 
-def merged_props() -> list[dict[str, Any]]:
+def merge_catalog_props(
+    catalog: list[dict[str, Any]], snapshots: dict[str, dict[str, Any]], errors: dict[str, str],
+) -> list[dict[str, Any]]:
     rows = []
-    for fixture in _catalog:
+    for fixture in catalog:
         shell = base_shell(fixture)
-        snapshot = _snapshots.get(shell["fixture_id"])
+        snapshot = snapshots.get(shell["fixture_id"])
         row = snapshot or shell
         if snapshot:
             live_fields = (
@@ -1950,8 +1963,8 @@ def merged_props() -> list[dict[str, Any]]:
                 "is_live", "is_finished", "is_upcoming", "score_real", "last_status_update", "_sort", "_timestamp",
             )
             row = {**snapshot, **{key: shell[key] for key in live_fields}}
-        if shell["fixture_id"] in _analysis_errors and not snapshot:
-            message = _analysis_errors[shell["fixture_id"]]
+        if shell["fixture_id"] in errors and not snapshot:
+            message = errors[shell["fixture_id"]]
             started_during_run = message == "La hora de inicio ya pasó; no se fabricará un snapshot retrospectivo"
             row = {
                 **shell,
@@ -1965,6 +1978,10 @@ def merged_props() -> list[dict[str, Any]]:
         row.get("_sort", 9), competition_priority(row), row.get("_timestamp", 0), row.get("league_name", "")
     ))
     return [{key: value for key, value in row.items() if not key.startswith("_")} for row in rows]
+
+
+def merged_props() -> list[dict[str, Any]]:
+    return merge_catalog_props(_catalog, _snapshots, _analysis_errors)
 
 
 def stored_props_for_date(fixture_date: str) -> list[dict[str, Any]]:
@@ -2021,25 +2038,34 @@ def stamp_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> None:
-    global _snapshots
+async def analyze_catalog(
+    fixtures: list[dict[str, Any]], fixture_date: str,
+    snapshots: dict[str, dict[str, Any]] | None = None,
+    errors: dict[str, str] | None = None,
+    progress: dict[str, Any] | None = None,
+    save_coverage: bool = True,
+) -> None:
+    snapshot_state = snapshots if snapshots is not None else _snapshots
+    error_state = errors if errors is not None else _analysis_errors
+    progress_state = progress if progress is not None else _progress
     candidates = []
     for fixture in fixtures:
         shell = base_shell(fixture)
-        snapshot = _snapshots.get(shell["fixture_id"])
+        snapshot = snapshot_state.get(shell["fixture_id"])
         outdated = bool(snapshot and snapshot.get("model_version") != MODEL_VERSION)
         if shell["is_upcoming"] and (snapshot is None or outdated):
             candidates.append(fixture)
     candidates.sort(key=lambda fixture: fixture_state(fixture.get("fixture") or {})["timestamp"])
-    _progress.update(
+    progress_state.update(
         phase="TEAM_AND_LEAGUE_DATA", done=0, total=max(len(candidates), 1),
         overall_done=0.0, overall_total=float(max(len(candidates) * 3, 1)),
         started_at=datetime.now(UTC).isoformat(),
     )
     if not candidates:
-        _progress.update(phase="COMPLETE", done=1, total=1)
-        _progress.update(overall_done=1.0, overall_total=1.0)
-        await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
+        progress_state.update(phase="COMPLETE", done=1, total=1)
+        progress_state.update(overall_done=1.0, overall_total=1.0)
+        if save_coverage:
+            await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
         return
     timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
     async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
@@ -2059,15 +2085,15 @@ async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> 
             except Exception as exc:
                 log.warning("Precarga incompleta fixture=%s: %s", base_shell(fixture)["fixture_id"], exc)
             finally:
-                _progress["done"] += 1
-                _progress["overall_done"] += 1.0
+                progress_state["done"] += 1
+                progress_state["overall_done"] += 1.0
 
         await asyncio.gather(*(warm(fixture) for fixture in candidates))
-        await preload_fixture_stats(client, historical_ids, overall_weight=float(len(candidates)))
+        await preload_fixture_stats(client, historical_ids, overall_weight=float(len(candidates)), progress=progress_state)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         for fixture in candidates:
             queue.put_nowait(fixture)
-        _progress.update(phase="PROBABILITY_MODEL", done=0, total=queue.qsize())
+        progress_state.update(phase="PROBABILITY_MODEL", done=0, total=queue.qsize())
 
         async def worker() -> None:
             while True:
@@ -2080,24 +2106,25 @@ async def analyze_catalog(fixtures: list[dict[str, Any]], fixture_date: str) -> 
                 try:
                     result = stamp_snapshot(await build_analysis(client, fixture))
                     if result["analysis_status"] in {"READY", "ABSTAINED"}:
-                        _snapshots[fixture_id] = result
+                        snapshot_state[fixture_id] = result
                         await asyncio.to_thread(db_save_snapshot, fixture_date, fixture_id, result.get("snapshot_cutoff_utc") or datetime.now(UTC).isoformat(), result)
-                    _analysis_errors.pop(fixture_id, None)
+                    error_state.pop(fixture_id, None)
                 except Exception as exc:
-                    _analysis_errors[fixture_id] = str(exc)
+                    error_state[fixture_id] = str(exc)
                     log.error("Análisis fallido fixture=%s: %s", fixture_id, exc)
                 finally:
-                    _progress["done"] += 1
-                    _progress["overall_done"] += 1.0
+                    progress_state["done"] += 1
+                    progress_state["overall_done"] += 1.0
                     queue.task_done()
 
         await asyncio.gather(*(worker() for _ in range(ANALYSIS_WORKERS)))
-    _progress.update(phase="COMPLETE", done=_progress["total"], total=_progress["total"])
-    _progress["overall_done"] = _progress["overall_total"]
-    ready = sum(row.get("analysis_status") == "READY" for row in _snapshots.values())
-    abstained = sum(row.get("analysis_status") == "ABSTAINED" for row in _snapshots.values())
-    log.info("Día procesado: ready=%s abstained=%s errors=%s", ready, abstained, len(_analysis_errors))
-    await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
+    progress_state.update(phase="COMPLETE", done=progress_state["total"], total=progress_state["total"])
+    progress_state["overall_done"] = progress_state["overall_total"]
+    ready = sum(row.get("analysis_status") == "READY" for row in snapshot_state.values())
+    abstained = sum(row.get("analysis_status") == "ABSTAINED" for row in snapshot_state.values())
+    log.info("Día procesado fecha=%s: ready=%s abstained=%s errors=%s", fixture_date, ready, abstained, len(error_state))
+    if save_coverage:
+        await asyncio.to_thread(db_save_coverage_manifest, coverage_payload())
 
 
 async def load_catalog(fixture_date: str, force: bool = False) -> None:
@@ -2128,6 +2155,69 @@ async def load_catalog(fixture_date: str, force: bool = False) -> None:
             log.info("Journal verificado: %s predicciones resueltas", resolved)
         if _analysis_task is None or _analysis_task.done():
             _analysis_task = asyncio.create_task(analyze_catalog(_catalog.copy(), fixture_date))
+
+
+async def load_future_catalog(fixture_date: str, force: bool = False) -> None:
+    """Prepare a future day without replacing today's live global catalog."""
+    async with _future_lock:
+        fresh = (
+            bool(_future_catalogs.get(fixture_date)) and
+            time.monotonic() - _future_loaded_at.get(fixture_date, 0.0) < CATALOG_TTL
+        )
+        if not fresh or force:
+            timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
+            async with httpx.AsyncClient(base_url=BASE_URL, headers={"x-apisports-key": API_KEY}, timeout=timeout) as client:
+                rows, _ = await discover_daily_catalog(client, fixture_date)
+            if not isinstance(rows, list):
+                raise RuntimeError("API-Football no devolvió un catálogo futuro válido")
+            _future_catalogs[fixture_date] = rows
+            _future_loaded_at[fixture_date] = time.monotonic()
+        snapshots = _future_snapshots.setdefault(
+            fixture_date, await asyncio.to_thread(db_load_snapshots, fixture_date)
+        )
+        errors = _future_errors.setdefault(fixture_date, {})
+        progress = _future_progress.setdefault(fixture_date, {
+            "phase": "IDLE", "done": 0, "total": 0, "overall_done": 0.0,
+            "overall_total": 1.0, "started_at": None,
+        })
+        task = _future_tasks.get(fixture_date)
+        if task is None or task.done():
+            _future_tasks[fixture_date] = asyncio.create_task(analyze_catalog(
+                _future_catalogs[fixture_date].copy(), fixture_date,
+                snapshots=snapshots, errors=errors, progress=progress, save_coverage=False,
+            ))
+
+
+def future_props(fixture_date: str) -> list[dict[str, Any]]:
+    return merge_catalog_props(
+        _future_catalogs.get(fixture_date, []),
+        _future_snapshots.get(fixture_date, {}),
+        _future_errors.get(fixture_date, {}),
+    )
+
+
+def future_sync_payload(fixture_date: str) -> dict[str, Any]:
+    props = future_props(fixture_date)
+    progress = _future_progress.get(fixture_date) or {
+        "phase": "IDLE", "done": 0, "total": 1, "overall_done": 0.0,
+        "overall_total": 1.0, "started_at": None,
+    }
+    counts: defaultdict[str, int] = defaultdict(int)
+    for row in props:
+        counts[str(row.get("analysis_status") or "PENDING")] += 1
+    task = _future_tasks.get(fixture_date)
+    running = bool(task and not task.done())
+    return {
+        "contract_version": CONTRACT_VERSION, "date": fixture_date, "total": len(props),
+        "eligible": sum(bool(row.get("is_upcoming")) for row in props),
+        "ready": counts["READY"], "abstained": counts["ABSTAINED"], "pending": counts["PENDING"],
+        "unavailable": counts["UNAVAILABLE"], "failed": counts["ERROR"],
+        "phase": progress["phase"], "phase_done": progress["done"], "phase_total": progress["total"],
+        "phase_progress": round(clamp(progress["done"] / max(progress["total"], 1), 0, 1), 4),
+        "progress": round(clamp(progress["overall_done"] / max(progress["overall_total"], 1.0), 0, 1), 4),
+        "running": running, "started_at": progress["started_at"],
+        "catalog_updated_at": datetime.now(UTC).isoformat(),
+    }
 
 
 def sync_payload() -> dict[str, Any]:
@@ -2342,9 +2432,13 @@ async def start_calibration(
 @app.get("/api/v1/sync")
 async def sync_status(date: str | None = Query(None)) -> dict[str, Any]:
     requested = date or now_local().strftime("%Y-%m-%d")
-    if requested != now_local().strftime("%Y-%m-%d"):
+    today = now_local().strftime("%Y-%m-%d")
+    if requested < today:
         props = await asyncio.to_thread(stored_props_for_date, requested)
         return stored_sync_payload(requested, props)
+    if requested > today:
+        await load_future_catalog(requested, False)
+        return future_sync_payload(requested)
     try:
         await load_catalog(requested, False)
         return sync_payload()
@@ -2377,8 +2471,12 @@ async def get_props(
 ) -> list[dict[str, Any]]:
     del all
     requested = date or now_local().strftime("%Y-%m-%d")
-    if requested != now_local().strftime("%Y-%m-%d"):
+    today = now_local().strftime("%Y-%m-%d")
+    if requested < today:
         return await asyncio.to_thread(stored_props_for_date, requested)
+    if requested > today:
+        await load_future_catalog(requested, refresh)
+        return future_props(requested)
     try:
         await load_catalog(requested, refresh)
         return merged_props()

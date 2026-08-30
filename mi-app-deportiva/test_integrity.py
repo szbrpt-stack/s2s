@@ -1,6 +1,13 @@
 from fastapi.testclient import TestClient
 
-from integrity_app import app
+from integrity_app import _wilson_interval, app
+
+
+def test_wilson_interval_is_bounded_and_contains_observed_rate():
+    interval = _wilson_interval(63, 100)
+    assert interval is not None
+    assert 0.0 <= interval['low'] <= 0.63 <= interval['high'] <= 1.0
+    assert _wilson_interval(0, 0) is None
 
 
 def test_health_and_integrity_endpoints():

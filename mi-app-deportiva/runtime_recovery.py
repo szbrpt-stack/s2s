@@ -35,6 +35,23 @@ def _age_minutes(value: Any) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 60.0)
 
 
+def _scorecard_sample_size(scorecard: dict[str, Any] | None) -> int:
+    if not isinstance(scorecard, dict):
+        return 0
+    for value in (
+        scorecard.get("resolved_predictions"),
+        (scorecard.get("overall") or {}).get("n") if isinstance(scorecard.get("overall"), dict) else None,
+        scorecard.get("n"),
+        scorecard.get("total"),
+    ):
+        try:
+            if value is not None:
+                return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def _db_runtime_snapshot() -> dict[str, Any]:
     if not main.DATABASE_URL or main.psycopg is None:
         return {
@@ -167,6 +184,11 @@ async def runtime_integrity() -> dict[str, Any]:
         "analysis_running": bool(main._analysis_task and not main._analysis_task.done()),
         "calibration_memory_running": memory_running,
         "calibration_jobs_running": snapshot["running_jobs"],
+        "refresh_policy": {
+            "snapshot_mode": "ON_DEMAND",
+            "automatic_scheduler_configured": False,
+            "triggers": ["/api/v1/sync", "/api/v1/coverage", "/api/v1/props"],
+        },
         "freshness": {
             "latest_snapshot_at": snapshot.get("latest_snapshot_at"),
             "snapshot_age_minutes": round(snapshot_age, 2) if snapshot_age is not None else None,
@@ -188,7 +210,7 @@ async def model_integrity() -> dict[str, Any]:
     holdout = latest.get("holdout") or {}
     walk = latest.get("walk_forward") or {}
     holdout_n = int(holdout.get("n") or 0)
-    score_n = int(scorecard.get("n") or scorecard.get("total") or 0)
+    score_n = _scorecard_sample_size(scorecard)
     passing_folds = int(walk.get("passing_folds") or 0)
     folds = int(walk.get("folds") or 0)
     gates = {
@@ -211,6 +233,7 @@ async def model_integrity() -> dict[str, Any]:
             "required_passing_folds": walk.get("required_passing_folds"),
             "stable_candidate": walk.get("stable_candidate"),
         },
+        "prequential_sample_size": score_n,
         "prequential_scorecard": scorecard,
         "reliability_gates": gates,
         "reliable_for_reporting": all(gates.values()),

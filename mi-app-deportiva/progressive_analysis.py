@@ -6,8 +6,8 @@ from typing import Any
 import httpx
 import main
 
-# Small working sets publish quickly and cap transient memory. HTTP concurrency,
-# not this batch size, remains the provider pressure control.
+# Smaller sets persist sooner and cap transient memory. Provider pressure remains
+# governed by the existing global rate limiter and HTTP concurrency controls.
 PROGRESSIVE_BATCH_SIZE = max(4, min(int(main.os.getenv("PROGRESSIVE_BATCH_SIZE", "8")), 24))
 
 
@@ -32,9 +32,6 @@ async def analyze_catalog_progressive(
     candidates.sort(key=lambda fixture: main.fixture_state(fixture.get("fixture") or {})["timestamp"])
 
     total = len(candidates)
-    # Three observable stages per fixture: evidence warm-up, advanced-history
-    # preload and model/persistence. This keeps /sync progress moving throughout
-    # the expensive preparation instead of appearing frozen until a result lands.
     work_total = max(total * 3, 1)
     progress_state.update(
         phase="PROGRESSIVE_ANALYSIS", done=0, total=work_total,
@@ -53,8 +50,9 @@ async def analyze_catalog_progressive(
 
     async def advance(amount: float = 1.0) -> None:
         async with progress_lock:
-            progress_state["overall_done"] = min(float(work_total), float(progress_state.get("overall_done", 0.0)) + amount)
-            progress_state["done"] = min(work_total, int(progress_state["overall_done"]))
+            value = min(float(work_total), float(progress_state.get("overall_done", 0.0)) + amount)
+            progress_state["overall_done"] = value
+            progress_state["done"] = min(work_total, int(value))
 
     timeout = httpx.Timeout(connect=10, read=35, write=10, pool=35)
     async with httpx.AsyncClient(base_url=main.BASE_URL, headers={"x-apisports-key": main.API_KEY}, timeout=timeout) as client:
@@ -83,15 +81,10 @@ async def analyze_catalog_progressive(
                 await asyncio.gather(*(warm(fixture) for fixture in warm_batch))
 
             progress_state["phase"] = "ADVANCED_HISTORY"
-            # preload_fixture_stats reports progress when supplied a weight. Give
-            # this batch exactly one unit per fixture, independent of history size.
-            before = float(progress_state["overall_done"])
-            await main.preload_fixture_stats(client, historical_ids, overall_weight=float(len(batch)), progress=progress_state)
-            # Normalize in case the helper had no historical ids and therefore
-            # could not report the stage itself.
-            expected_after = before + len(batch)
-            progress_state["overall_done"] = min(float(work_total), max(float(progress_state.get("overall_done", 0.0)), expected_after))
-            progress_state["done"] = min(work_total, int(progress_state["overall_done"]))
+            # Keep the helper focused on fetching/cache population. Account for
+            # this stage here so /sync has one consistent progress writer.
+            await main.preload_fixture_stats(client, historical_ids)
+            await advance(float(len(batch)))
 
             progress_state["phase"] = "MODEL_AND_PERSIST"
             queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()

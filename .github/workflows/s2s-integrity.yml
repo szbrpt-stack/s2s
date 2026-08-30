@@ -34,3 +34,59 @@ jobs:
           DATABASE_URL: ''
           API_FOOTBALL_KEY: ''
         run: pytest -q test_integrity.py
+
+  staging-http-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Render staging and validate endpoints
+        env:
+          BASE_URL: https://s2s-integrity-staging.onrender.com
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          base = 'https://s2s-integrity-staging.onrender.com'
+          paths = [
+              '/health',
+              '/api/v1/runtime/integrity',
+              '/api/v1/model/integrity',
+              '/api/v1/model/empirical-integrity',
+          ]
+
+          def get(path):
+              last = None
+              for attempt in range(12):
+                  try:
+                      with urllib.request.urlopen(base + path, timeout=30) as response:
+                          body = response.read().decode('utf-8')
+                          if response.status != 200:
+                              raise RuntimeError(f'{path}: HTTP {response.status}')
+                          return json.loads(body)
+                  except Exception as exc:
+                      last = exc
+                      if attempt == 11:
+                          raise
+                      time.sleep(10)
+              raise last
+
+          payloads = {path: get(path) for path in paths}
+          runtime = payloads['/api/v1/runtime/integrity']
+          health = payloads['/health']
+
+          print('health=', json.dumps(health, sort_keys=True))
+          print('runtime=', json.dumps(runtime, sort_keys=True))
+          print('model=', json.dumps(payloads['/api/v1/model/integrity'], sort_keys=True))
+          print('empirical=', json.dumps(payloads['/api/v1/model/empirical-integrity'], sort_keys=True))
+
+          if not runtime.get('engine_version'):
+              raise SystemExit('runtime integrity missing engine_version')
+          if not runtime.get('model_version'):
+              raise SystemExit('runtime integrity missing model_version')
+
+          database = runtime.get('database') or health.get('database')
+          print('database_backend=', database)
+          if database and str(database).lower().startswith('sqlite'):
+              print('WARNING: staging is using SQLite/local persistence, not the shared PostgreSQL database')
+          PY

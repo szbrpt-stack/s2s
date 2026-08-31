@@ -1,0 +1,34 @@
+name: S2S periodic refresh
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake and refresh S2S
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent \
+            --max-time 180 \
+            --retry 2 \
+            --retry-delay 10 \
+            https://s2s-1-na3v.onrender.com/api/v1/sync \
+            > /tmp/s2s-sync.json
+          python - <<'PY'
+          import json
+          with open('/tmp/s2s-sync.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          print({
+              'date': data.get('date'),
+              'total': data.get('total'),
+              'ready': data.get('ready'),
+              'pending': data.get('pending'),
+              'running': data.get('running'),
+              'progress': data.get('progress'),
+          })
+          PY

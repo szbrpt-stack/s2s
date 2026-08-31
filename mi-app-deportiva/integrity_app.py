@@ -4,6 +4,12 @@ import math
 from typing import Any
 
 import main
+import incremental_catalog
+
+# Install provider hydration policy before runtime_recovery can start its
+# automatic catalog refresh task.
+incremental_catalog.install()
+
 import runtime_recovery
 import progressive_analysis
 

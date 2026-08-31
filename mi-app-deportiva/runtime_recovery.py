@@ -15,7 +15,12 @@ BOOTED_AT = datetime.now(timezone.utc)
 STALE_JOB_MINUTES = max(10, int(os.getenv("CALIBRATION_STALE_MINUTES", "45")))
 WATCHDOG_SECONDS = max(60, int(os.getenv("RUNTIME_WATCHDOG_SECONDS", "300")))
 SNAPSHOT_WARN_HOURS = max(6, int(os.getenv("SNAPSHOT_WARN_HOURS", "36")))
+AUTO_REFRESH_SECONDS = max(300, int(os.getenv("AUTO_REFRESH_SECONDS", "900")))
 _watchdog_task: asyncio.Task[None] | None = None
+_auto_refresh_task: asyncio.Task[None] | None = None
+_last_auto_refresh: dict[str, Any] = {
+    "started_at": None, "finished_at": None, "date": None, "error": None,
+}
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -144,12 +149,50 @@ async def _watchdog() -> None:
         await asyncio.sleep(WATCHDOG_SECONDS)
 
 
+async def _refresh_current_catalog(force: bool) -> None:
+    fixture_date = main.now_local().strftime("%Y-%m-%d")
+    _last_auto_refresh.update({
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "date": fixture_date,
+        "error": None,
+    })
+    try:
+        await main.load_catalog(fixture_date, force)
+        _last_auto_refresh["finished_at"] = datetime.now(timezone.utc).isoformat()
+        main.log.info(
+            "Auto refresh complete date=%s force=%s catalog=%s analysis_running=%s",
+            fixture_date, force, len(main._catalog),
+            bool(main._analysis_task and not main._analysis_task.done()),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _last_auto_refresh.update({
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+        })
+        main.log.exception("Automatic catalog refresh failed date=%s", fixture_date)
+
+
+async def _auto_refresh_loop() -> None:
+    # First wake-up refresh is non-forced so an inbound request racing startup
+    # can share the same catalog lock/cache instead of duplicating provider work.
+    await _refresh_current_catalog(False)
+    while True:
+        await asyncio.sleep(AUTO_REFRESH_SECONDS)
+        await _refresh_current_catalog(True)
+
+
 async def _startup_recovery() -> None:
-    global _watchdog_task
+    global _watchdog_task, _auto_refresh_task
     recovered = await asyncio.to_thread(_recover_stale_jobs)
     main.log.info("Runtime recovery boot_id=%s recovered=%s", BOOT_ID, recovered)
     if _watchdog_task is None or _watchdog_task.done():
         _watchdog_task = asyncio.create_task(_watchdog())
+    if _auto_refresh_task is None or _auto_refresh_task.done():
+        _auto_refresh_task = asyncio.create_task(_auto_refresh_loop())
+        main.log.info("Automatic catalog refresh enabled interval_seconds=%s", AUTO_REFRESH_SECONDS)
 
 
 app.add_event_handler("startup", _startup_recovery)
@@ -172,6 +215,8 @@ async def runtime_integrity() -> dict[str, Any]:
         issues.append("SNAPSHOT_FRESHNESS_DEGRADED")
     if snapshot["running_jobs"] and not memory_running:
         issues.append("DURABLE_MEMORY_JOB_MISMATCH")
+    if _last_auto_refresh.get("error"):
+        issues.append("AUTO_REFRESH_ERROR")
     return {
         "status": "ok" if not issues else "degraded",
         "issues": issues,
@@ -185,9 +230,12 @@ async def runtime_integrity() -> dict[str, Any]:
         "calibration_memory_running": memory_running,
         "calibration_jobs_running": snapshot["running_jobs"],
         "refresh_policy": {
-            "snapshot_mode": "ON_DEMAND",
-            "automatic_scheduler_configured": False,
-            "triggers": ["/api/v1/sync", "/api/v1/coverage", "/api/v1/props"],
+            "snapshot_mode": "AUTO_ON_WAKE_AND_PERIODIC_WHILE_ACTIVE",
+            "automatic_scheduler_configured": True,
+            "interval_seconds": AUTO_REFRESH_SECONDS,
+            "render_free_sleep_aware": True,
+            "last_auto_refresh": dict(_last_auto_refresh),
+            "manual_triggers": ["/api/v1/sync", "/api/v1/coverage", "/api/v1/props"],
         },
         "freshness": {
             "latest_snapshot_at": snapshot.get("latest_snapshot_at"),

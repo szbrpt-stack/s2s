@@ -1,9 +1,8 @@
-"""Leakage-safe dataset builder for S2S model calibration.
+"""Leakage-safe, egress-aware dataset builder for S2S calibration.
 
-Builds a reproducible, chronological dataset from persisted predictions,
-resolved outcomes, pre-kickoff snapshots and optional advanced fixture data.
-It is strictly a sports forecasting/calibration artifact: no odds, staking,
-or wagering logic is produced.
+PostgreSQL mode performs the filtering and joins in-database and returns only
+rows belonging to the requested model cohort. It never downloads the complete
+advanced_fixture_stats warehouse.
 """
 from __future__ import annotations
 
@@ -51,96 +50,106 @@ class TrainingRow:
     advanced_available: bool
 
 
-def _fetch_rows(model_version: str | None = None) -> tuple[list[tuple[Any, ...]], dict[str, tuple[Any, ...]], dict[str, tuple[Any, ...]]]:
-    where = " WHERE model_version=%s" if model_version and main.DATABASE_URL else ""
-    sqlite_where = " WHERE model_version=?" if model_version and not main.DATABASE_URL else ""
-    params = (model_version,) if model_version else ()
-    if main.DATABASE_URL:
-        with main.psycopg.connect(main.DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
-            outcomes = db.execute(
-                "SELECT fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at FROM prediction_outcomes" + where,
-                params,
-            ).fetchall()
-            snapshots = db.execute(
-                "SELECT fixture_id,fixture_date,cutoff_utc,model_version,payload,created_at FROM snapshots" + where,
-                params,
-            ).fetchall()
-            advanced = db.execute(
-                "SELECT fixture_id,payload,created_at FROM advanced_fixture_stats"
-            ).fetchall()
-    else:
-        import sqlite3
-        with sqlite3.connect(main.STATE_DB_PATH) as db:
-            outcomes = db.execute(
-                "SELECT fixture_id,kickoff_utc,model_version,prediction,actual_home,actual_away,metrics,resolved_at FROM prediction_outcomes" + sqlite_where,
-                params,
-            ).fetchall()
-            snapshots = db.execute(
-                "SELECT fixture_id,fixture_date,cutoff_utc,model_version,payload,created_at FROM snapshots" + sqlite_where,
-                params,
-            ).fetchall()
-            advanced = db.execute("SELECT fixture_id,payload,created_at FROM advanced_fixture_stats").fetchall()
-    return outcomes, {str(row[0]): row for row in snapshots}, {str(row[0]): row for row in advanced}
+def _fetch_joined_postgres(model_version: str | None) -> list[tuple[Any, ...]]:
+    """One bounded query; advanced payload is returned only for matching outcomes."""
+    where = "AND o.model_version=%s AND s.model_version=%s" if model_version else ""
+    params = (model_version, model_version) if model_version else ()
+    query = f"""
+        SELECT
+            o.fixture_id,
+            o.kickoff_utc,
+            o.model_version,
+            o.prediction,
+            o.actual_home,
+            o.actual_away,
+            o.metrics,
+            s.cutoff_utc,
+            s.payload,
+            a.payload
+        FROM prediction_outcomes o
+        JOIN snapshots s ON s.fixture_id=o.fixture_id
+        LEFT JOIN advanced_fixture_stats a
+          ON a.fixture_id = CASE
+              WHEN o.fixture_id ~ '^[0-9]+$' THEN o.fixture_id::bigint
+              ELSE NULL
+          END
+        WHERE o.kickoff_utc IS NOT NULL
+          AND s.cutoff_utc IS NOT NULL
+          AND s.cutoff_utc::timestamptz <= o.kickoff_utc::timestamptz
+          {where}
+        ORDER BY o.kickoff_utc::timestamptz, o.fixture_id
+    """
+    with main.psycopg.connect(main.DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
+        return db.execute(query, params).fetchall()
+
+
+def _fetch_joined_sqlite(model_version: str | None) -> list[tuple[Any, ...]]:
+    import sqlite3
+    where = "AND o.model_version=? AND s.model_version=?" if model_version else ""
+    params = (model_version, model_version) if model_version else ()
+    query = f"""
+        SELECT o.fixture_id,o.kickoff_utc,o.model_version,o.prediction,
+               o.actual_home,o.actual_away,o.metrics,s.cutoff_utc,s.payload,a.payload
+        FROM prediction_outcomes o
+        JOIN snapshots s ON s.fixture_id=o.fixture_id
+        LEFT JOIN advanced_fixture_stats a ON CAST(a.fixture_id AS TEXT)=o.fixture_id
+        WHERE o.kickoff_utc IS NOT NULL AND s.cutoff_utc IS NOT NULL {where}
+        ORDER BY o.kickoff_utc,o.fixture_id
+    """
+    with sqlite3.connect(main.STATE_DB_PATH) as db:
+        return db.execute(query, params).fetchall()
 
 
 def build_dataset(model_version: str | None = None) -> tuple[list[TrainingRow], dict[str, Any]]:
-    outcomes, snapshots, advanced = _fetch_rows(model_version)
+    joined = _fetch_joined_postgres(model_version) if main.DATABASE_URL else _fetch_joined_sqlite(model_version)
     rows: list[TrainingRow] = []
-    rejected = {"missing_kickoff": 0, "missing_snapshot": 0, "future_cutoff": 0, "invalid_outcome": 0}
+    rejected = {"missing_kickoff": 0, "future_cutoff": 0, "invalid_outcome": 0}
     advanced_supported = 0
 
-    for outcome in outcomes:
-        fixture_id = str(outcome[0])
-        kickoff = _dt(outcome[1])
-        snapshot_row = snapshots.get(fixture_id)
+    for item in joined:
+        fixture_id = str(item[0])
+        kickoff, cutoff = _dt(item[1]), _dt(item[7])
         if kickoff is None:
             rejected["missing_kickoff"] += 1
             continue
-        if snapshot_row is None:
-            rejected["missing_snapshot"] += 1
-            continue
-        cutoff = _dt(snapshot_row[2])
         if cutoff is None or cutoff > kickoff:
             rejected["future_cutoff"] += 1
             continue
         try:
-            actual_home, actual_away = int(outcome[4]), int(outcome[5])
+            actual_home, actual_away = int(item[4]), int(item[5])
         except (TypeError, ValueError):
             rejected["invalid_outcome"] += 1
             continue
 
-        snapshot_payload = _json(snapshot_row[4])
-        advanced_row = advanced.get(fixture_id)
-        advanced_payload = _json(advanced_row[1]) if advanced_row else {}
+        snapshot_payload = _json(item[8])
+        advanced_payload = _json(item[9]) if item[9] else {}
         availability = str(advanced_payload.get("availability") or "").upper()
         teams = advanced_payload.get("teams")
         supported = availability != "UNAVAILABLE" and isinstance(teams, dict) and bool(teams)
-        if supported:
-            advanced_supported += 1
+        advanced_supported += int(supported)
 
         rows.append(TrainingRow(
             fixture_id=fixture_id,
             kickoff_utc=kickoff.astimezone(UTC).isoformat(),
             feature_cutoff_utc=cutoff.astimezone(UTC).isoformat(),
-            model_version=str(outcome[2]),
+            model_version=str(item[2]),
             feature_version=str(snapshot_payload.get("feature_version") or main.ENGINE_VERSION),
             actual_home=actual_home,
             actual_away=actual_away,
-            prediction=_json(outcome[3]),
-            metrics=_json(outcome[6]),
+            prediction=_json(item[3]),
+            metrics=_json(item[6]),
             snapshot=snapshot_payload,
-            advanced=advanced_payload if advanced_row else None,
+            advanced=advanced_payload if item[9] else None,
             advanced_available=supported,
         ))
 
-    rows.sort(key=lambda row: (row.kickoff_utc, row.fixture_id))
     n = len(rows)
     train_end = int(n * 0.70)
     validation_end = int(n * 0.85)
     summary = {
         "generated_at": datetime.now(UTC).isoformat(),
         "model_version": model_version or "ALL",
-        "raw_outcomes": len(outcomes),
+        "query_strategy": "server_side_join_filtered_by_model_version",
         "usable_rows": n,
         "rejected": rejected,
         "leakage_violations_in_output": 0,

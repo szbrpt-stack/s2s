@@ -176,8 +176,8 @@ async def _refresh_current_catalog(force: bool) -> None:
 
 
 async def _auto_refresh_loop() -> None:
-    # First wake-up refresh is non-forced so an inbound request racing startup
-    # can share the same catalog lock/cache instead of duplicating provider work.
+    # Refresh policy belongs to the backend. External schedulers only keep the
+    # process awake through /health and never force provider/database work.
     await _refresh_current_catalog(False)
     while True:
         await asyncio.sleep(AUTO_REFRESH_SECONDS)
@@ -196,6 +196,28 @@ async def _startup_recovery() -> None:
 
 
 app.add_event_handler("startup", _startup_recovery)
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    """Cheap heartbeat endpoint: no DB access and no provider calls."""
+    now = datetime.now(timezone.utc)
+    return {
+        "status": "ok",
+        "boot_id": BOOT_ID,
+        "uptime_seconds": int((now - BOOTED_AT).total_seconds()),
+        "engine_version": main.ENGINE_VERSION,
+        "model_version": main.MODEL_VERSION,
+        "catalog_date": main._catalog_date,
+        "catalog_size": len(main._catalog),
+        "analysis_running": bool(main._analysis_task and not main._analysis_task.done()),
+        "last_auto_refresh": dict(_last_auto_refresh),
+        "scheduler": {
+            "owner": "backend",
+            "interval_seconds": AUTO_REFRESH_SECONDS,
+            "external_role": "heartbeat_only",
+        },
+    }
 
 
 @app.get("/api/v1/runtime/integrity")
@@ -232,8 +254,11 @@ async def runtime_integrity() -> dict[str, Any]:
         "refresh_policy": {
             "snapshot_mode": "AUTO_ON_WAKE_AND_PERIODIC_WHILE_ACTIVE",
             "automatic_scheduler_configured": True,
+            "scheduler_owner": "backend",
             "interval_seconds": AUTO_REFRESH_SECONDS,
             "render_free_sleep_aware": True,
+            "external_scheduler_role": "HEARTBEAT_ONLY",
+            "heartbeat_endpoint": "/health",
             "last_auto_refresh": dict(_last_auto_refresh),
             "manual_triggers": ["/api/v1/sync", "/api/v1/coverage", "/api/v1/props"],
         },

@@ -1,34 +1,40 @@
-name: S2S periodic refresh
+name: S2S heartbeat
 
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: s2s-heartbeat
+  cancel-in-progress: true
+
 jobs:
-  refresh:
+  heartbeat:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
-      - name: Wake and refresh S2S
+      - name: Keep Render awake without forcing data work
         run: |
           set -euo pipefail
           curl --fail --show-error --silent \
-            --max-time 180 \
+            --max-time 120 \
             --retry 2 \
             --retry-delay 10 \
-            https://s2s-1-na3v.onrender.com/api/v1/sync \
-            > /tmp/s2s-sync.json
+            https://s2s-1-na3v.onrender.com/health \
+            > /tmp/s2s-health.json
           python - <<'PY'
           import json
-          with open('/tmp/s2s-sync.json', 'r', encoding='utf-8') as f:
+          with open('/tmp/s2s-health.json', 'r', encoding='utf-8') as f:
               data = json.load(f)
+          assert data.get('status') == 'ok', data
           print({
-              'date': data.get('date'),
-              'total': data.get('total'),
-              'ready': data.get('ready'),
-              'pending': data.get('pending'),
-              'running': data.get('running'),
-              'progress': data.get('progress'),
+              'status': data.get('status'),
+              'boot_id': data.get('boot_id'),
+              'uptime_seconds': data.get('uptime_seconds'),
+              'catalog_date': data.get('catalog_date'),
+              'catalog_size': data.get('catalog_size'),
+              'analysis_running': data.get('analysis_running'),
+              'scheduler': data.get('scheduler'),
           })
           PY

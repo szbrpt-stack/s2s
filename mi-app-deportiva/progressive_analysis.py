@@ -8,8 +8,6 @@ from typing import Any
 import httpx
 import main
 
-# Smaller sets persist sooner and cap transient memory. Provider pressure remains
-# governed by the existing global rate limiter and HTTP concurrency controls.
 PROGRESSIVE_BATCH_SIZE = max(4, min(int(main.os.getenv("PROGRESSIVE_BATCH_SIZE", "8")), 24))
 RESOURCE_POLICY_LOOKBACK = max(100, min(int(main.os.getenv("RESOURCE_POLICY_LOOKBACK", "3000")), 10000))
 RESOURCE_POLICY_MIN_SAMPLES = max(3, min(int(main.os.getenv("RESOURCE_POLICY_MIN_SAMPLES", "6")), 30))
@@ -18,54 +16,43 @@ RESOURCE_POLICY_READY_RATE = max(0.05, min(float(main.os.getenv("RESOURCE_POLICY
 
 
 def _league_resource_policy() -> dict[int, dict[str, Any]]:
-    """Classify leagues from recent durable evidence, never from reputation.
-
-    A/PROBE leagues may warm advanced fixture statistics. B/C leagues keep the
-    core mathematical analysis but do not spend HTTP, RAM or cache on advanced
-    markets whose historical coverage has not justified that cost.
-    """
+    """Classify leagues with server-side aggregation to minimize DB egress."""
     if not main.DATABASE_URL or main.psycopg is None:
         return {}
     try:
         with main.psycopg.connect(main.DATABASE_URL, connect_timeout=15, prepare_threshold=None) as db:
             rows = db.execute(
-                "SELECT payload FROM snapshots ORDER BY created_at DESC LIMIT %s",
+                """WITH recent AS (
+                       SELECT payload::jsonb AS p
+                       FROM snapshots
+                       ORDER BY created_at DESC
+                       LIMIT %s
+                   )
+                   SELECT
+                       NULLIF(p->>'league_id','')::int AS league_id,
+                       COUNT(*)::int AS n,
+                       COUNT(*) FILTER (WHERE p->>'analysis_status'='READY')::int AS ready_n,
+                       COUNT(*) FILTER (WHERE
+                           p #>> '{market_coverage,corners,status}'='SUPPORTED' OR
+                           p #>> '{market_coverage,cards,status}'='SUPPORTED' OR
+                           p #>> '{market_coverage,shots,status}'='SUPPORTED'
+                       )::int AS advanced_n
+                   FROM recent
+                   WHERE NULLIF(p->>'league_id','') IS NOT NULL
+                   GROUP BY 1""",
                 (RESOURCE_POLICY_LOOKBACK,),
             ).fetchall()
     except Exception as exc:
         main.log.warning("Resource policy history unavailable: %s", exc)
         return {}
 
-    stats: dict[int, dict[str, int]] = defaultdict(lambda: {"n": 0, "ready": 0, "advanced": 0})
-    for (raw_payload,) in rows:
-        try:
-            payload = main.json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
-        except (TypeError, main.json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        try:
-            league_id = int(payload.get("league_id") or 0)
-        except (TypeError, ValueError):
-            continue
-        if league_id <= 0:
-            continue
-        item = stats[league_id]
-        item["n"] += 1
-        item["ready"] += int(payload.get("analysis_status") == "READY")
-        coverage = payload.get("market_coverage") or {}
-        advanced_supported = any(
-            isinstance(coverage.get(name), dict) and coverage[name].get("status") == "SUPPORTED"
-            for name in ("corners", "cards", "shots")
-        )
-        item["advanced"] += int(advanced_supported)
-
     policy: dict[int, dict[str, Any]] = {}
-    for league_id, item in stats.items():
-        n = item["n"]
-        ready_rate = item["ready"] / n if n else 0.0
-        advanced_rate = item["advanced"] / n if n else 0.0
-        if n < RESOURCE_POLICY_MIN_SAMPLES:
+    for league_id, n, ready_n, advanced_n in rows:
+        if not league_id or not n:
+            continue
+        ready_rate = int(ready_n) / int(n)
+        advanced_rate = int(advanced_n) / int(n)
+        if int(n) < RESOURCE_POLICY_MIN_SAMPLES:
             tier = "PROBE"
         elif advanced_rate >= RESOURCE_POLICY_ADVANCED_RATE:
             tier = "A"
@@ -73,9 +60,9 @@ def _league_resource_policy() -> dict[int, dict[str, Any]]:
             tier = "B"
         else:
             tier = "C"
-        policy[league_id] = {
+        policy[int(league_id)] = {
             "tier": tier,
-            "sample": n,
+            "sample": int(n),
             "ready_rate": round(ready_rate, 4),
             "advanced_rate": round(advanced_rate, 4),
             "advanced_prefetch": tier in {"A", "PROBE"},
@@ -215,8 +202,7 @@ async def analyze_catalog_progressive(
             for tier in batch_tiers.values():
                 tier_counts[str(tier.get("tier") or "UNKNOWN")] += 1
             main.log.info(
-                "Lote progresivo persistido fecha=%s fixtures=%s/%s progreso=%.1f%% snapshots=%s "
-                "tiers=%s advanced_ids=%s cache_released=%s",
+                "Lote progresivo persistido fecha=%s fixtures=%s/%s progreso=%.1f%% snapshots=%s tiers=%s advanced_ids=%s cache_released=%s",
                 fixture_date, min(start + len(batch), total), total,
                 100.0 * float(progress_state["overall_done"]) / work_total, len(snapshot_state),
                 dict(tier_counts), len(historical_ids), released,
